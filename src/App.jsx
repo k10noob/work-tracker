@@ -1,14 +1,16 @@
 /* ============================================================
-   WORK HOURS TRACKER — Firebase Edition v2
-   NEW: Set Checkout Time + Weekly/Monthly/FY Analytics
+   WORK HOURS TRACKER — Firebase Edition v3
+   NEW in v3: Company Holidays + 1st-Saturday override + Alarms
    ============================================================ */
 
-import { useState, useEffect, useMemo, useRef } from "react";
+import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import {
   Home, Calendar as CalendarIcon, BarChart3, Plus, X,
   ChevronLeft, ChevronRight, Download, Clock, AlertCircle,
   Palmtree, History as HistoryIcon, TrendingUp, CheckCircle2,
   Trash2, Sparkles, LogOut, Mail, Lock, User, Loader2,
+  Settings as SettingsIcon, Bell, BellOff, PartyPopper,
+  Briefcase, Play,
 } from "lucide-react";
 
 import { initializeApp } from "firebase/app";
@@ -18,7 +20,8 @@ import {
   updateProfile,
 } from "firebase/auth";
 import {
-  getFirestore, doc, setDoc, onSnapshot, serverTimestamp,
+  getFirestore, doc, setDoc, onSnapshot, serverTimestamp, getDoc,
+  collection, query, where, getDocs,
 } from "firebase/firestore";
 
 // 🔑 PASTE YOUR FIREBASE CONFIG HERE
@@ -39,6 +42,18 @@ const googleProvider = new GoogleAuthProvider();
 const TARGET_MINUTES = 510;
 const ANNUAL_LEAVES = 20;
 const LOCAL_KEY = "work_tracker_v1";
+
+/* Settings shape stored at users/{uid}.settings */
+const DEFAULT_SETTINGS = {
+  firstSatOverrides: {},   // { "2026-07": "working" }  → that month's 1st Sat is a working day
+  companyHolidays: {},     // { "2026-07-25": { label: "Shifted Saturday off" } }
+  alarms: [],              // [{ id, label, offsetMin, repeatMin, enabled }]
+  alarmSound: "double",
+  alarmVolume: 0.6,
+  vibrate: true,
+  notify: true,
+};
+const ALARM_GRACE_MS = 5 * 60 * 1000;   // don't blast a beep for an alarm that passed long ago
 
 /* ---- Helpers ---- */
 const pad = (n) => String(n).padStart(2, "0");
@@ -88,33 +103,54 @@ const firstSaturday = (year,month) => {
   for(let day=1;day<=7;day++) if(new Date(year,month,day).getDay()===6) return day;
   return null;
 };
-const isOff = (d) => {
-  if(d.getDay()===0) return true;
-  if(d.getDay()===6&&d.getDate()===firstSaturday(d.getFullYear(),d.getMonth())) return true;
-  return false;
-};
-const dayKind = (d) => {
+const monthKeyOf = (year,month) => `${year}-${pad(month+1)}`;
+const isFirstSatDate = (d) => d.getDay()===6 && d.getDate()===firstSaturday(d.getFullYear(),d.getMonth());
+
+/* ---- Off-day resolution (single source of truth) ----
+   Priority:
+     1. Sunday                              → always off
+     2. Company holiday (custom date)       → off, NOT deducted from leave quota
+     3. 1st Saturday                        → off, unless overridden to "working" for that month
+     4. Everything else                     → working
+*/
+const dayKind = (d,settings) => {
+  const s = settings || DEFAULT_SETTINGS;
   if(d.getDay()===0) return "sunday";
-  if(d.getDay()===6&&d.getDate()===firstSaturday(d.getFullYear(),d.getMonth())) return "first-sat";
+  if(s.companyHolidays && s.companyHolidays[dateKey(d)]) return "holiday";
+  if(isFirstSatDate(d)) {
+    const ov = s.firstSatOverrides ? s.firstSatOverrides[monthKeyOf(d.getFullYear(),d.getMonth())] : null;
+    return ov==="working" ? "working" : "first-sat";
+  }
   return "working";
+};
+const isOff = (d,settings) => dayKind(d,settings)!=="working";
+const holidayLabel = (d,settings) => {
+  const s = settings || DEFAULT_SETTINGS;
+  const h = s.companyHolidays ? s.companyHolidays[dateKey(d)] : null;
+  return (h && h.label) ? h.label : "Company holiday";
 };
 const fyStartFor = (d) => { const y=d.getMonth()>=3?d.getFullYear():d.getFullYear()-1; return new Date(y,3,1); };
 const fyEndFor = (d) => { const s=fyStartFor(d); return new Date(s.getFullYear()+1,2,31); };
 const fyLabel = (d) => { const s=fyStartFor(d); return `Apr ${s.getFullYear()} – Mar ${s.getFullYear()+1}`; };
-const workingDaysInMonth = (year,month) => {
+const workingDaysInMonth = (year,month,settings) => {
   const last=new Date(year,month+1,0).getDate(); let n=0;
-  for(let d=1;d<=last;d++) if(!isOff(new Date(year,month,d))) n++;
+  for(let d=1;d<=last;d++) if(!isOff(new Date(year,month,d),settings)) n++;
+  return n;
+};
+const holidaysInMonth = (year,month,settings) => {
+  const last=new Date(year,month+1,0).getDate(); let n=0;
+  for(let d=1;d<=last;d++) if(dayKind(new Date(year,month,d),settings)==="holiday") n++;
   return n;
 };
 
 /* ---- Week helper ---- */
-const getWeeksInMonth = (year, month, logs) => {
+const getWeeksInMonth = (year, month, logs, settings) => {
   const lastDayNum=new Date(year,month+1,0).getDate();
   const weeks=[]; let cw=null;
   for(let d=1;d<=lastDayNum;d++) {
     const date=new Date(year,month,d), dow=date.getDay();
     if(dow===1||d===1) cw={startDate:new Date(date),endDate:null,workingDays:0,workedDays:0,totalMinutes:0};
-    if(cw&&!isOff(date)) {
+    if(cw&&!isOff(date,settings)) {
       cw.workingDays++;
       const log=logs[dateKey(date)];
       if(log?.status==="working") { cw.workedDays++; cw.totalMinutes+=log.totalMinutes||0; }
@@ -130,36 +166,121 @@ const getWeeksInMonth = (year, month, logs) => {
 };
 
 /* ---- Analytics helpers ---- */
-const getMonthlyStats = (logs,year,month) => {
-  const totalWorkingDays=workingDaysInMonth(year,month);
+const getMonthlyStats = (logs,year,month,settings) => {
+  const totalWorkingDays=workingDaysInMonth(year,month,settings);
+  const companyHolidays=holidaysInMonth(year,month,settings);
   const last=new Date(year,month+1,0).getDate();
   let workedDays=0,leavesTaken=0,totalMinutes=0;
   for(let d=1;d<=last;d++) {
-    const log=logs[dateKey(new Date(year,month,d))]; if(!log) continue;
+    const date=new Date(year,month,d);
+    const log=logs[dateKey(date)]; if(!log) continue;
     if(log.status==="working") { workedDays++; totalMinutes+=log.totalMinutes||0; }
-    else if(log.status==="leave") leavesTaken++;
+    // a leave that later became a company holiday no longer burns quota
+    else if(log.status==="leave" && !isOff(date,settings)) leavesTaken++;
   }
-  return { totalWorkingDays, workedDays, leavesTaken, totalMinutes, expectedMinutes:totalWorkingDays*TARGET_MINUTES, surplus:totalMinutes-workedDays*TARGET_MINUTES, avgPerDay:workedDays>0?Math.round(totalMinutes/workedDays):0 };
+  return { totalWorkingDays, companyHolidays, workedDays, leavesTaken, totalMinutes, expectedMinutes:totalWorkingDays*TARGET_MINUTES, surplus:totalMinutes-workedDays*TARGET_MINUTES, avgPerDay:workedDays>0?Math.round(totalMinutes/workedDays):0 };
 };
 const getFYSurplus = (logs,refDate) => {
   const start=fyStartFor(refDate),end=fyEndFor(refDate); let s=0;
   Object.values(logs).forEach(l=>{ if(l.status!=="working") return; const d=parseKey(l.date); if(d>=start&&d<=end) s+=(l.totalMinutes||0)-TARGET_MINUTES; });
   return s;
 };
-const getLeavesUsedFY = (logs,refDate) => {
+const getLeavesUsedFY = (logs,refDate,settings) => {
   const start=fyStartFor(refDate),end=fyEndFor(refDate);
-  return Object.values(logs).filter(l=>{ if(l.status!=="leave") return false; const d=parseKey(l.date); return d>=start&&d<=end; }).length;
+  return Object.values(logs).filter(l=>{
+    if(l.status!=="leave") return false;
+    const d=parseKey(l.date);
+    if(d<start||d>end) return false;
+    return !isOff(d,settings);   // company holiday / off day → doesn't burn quota
+  }).length;
 };
+
+/* ============================================================
+   ALARM ENGINE — Web Audio beeps, notifications, vibration
+   No audio files needed; tones are synthesised in the browser.
+   ============================================================ */
+let _audioCtx = null;
+const getAudioCtx = () => {
+  if(typeof window==="undefined") return null;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if(!AC) return null;
+  if(!_audioCtx) { try { _audioCtx = new AC(); } catch { return null; } }
+  if(_audioCtx.state==="suspended") _audioCtx.resume().catch(()=>{});
+  return _audioCtx;
+};
+/* Browsers block audio until the user interacts once. Any tap unlocks it. */
+const unlockAudio = () => { const c=getAudioCtx(); if(c&&c.state==="suspended") c.resume().catch(()=>{}); };
+if(typeof window!=="undefined") {
+  const once=()=>{ unlockAudio(); window.removeEventListener("pointerdown",once); window.removeEventListener("keydown",once); };
+  window.addEventListener("pointerdown",once); window.addEventListener("keydown",once);
+}
+
+const ALARM_SOUNDS = {
+  single: { label:"Single beep",  seq:[[880,0.28]] },
+  double: { label:"Double beep",  seq:[[880,0.16],[880,0.16]] },
+  triple: { label:"Triple beep",  seq:[[880,0.14],[880,0.14],[880,0.14]] },
+  chime:  { label:"Rising chime", seq:[[659,0.22],[784,0.22],[988,0.42]] },
+  urgent: { label:"Urgent",       seq:[[1046,0.1],[1318,0.1],[1046,0.1],[1318,0.1],[1046,0.3]] },
+};
+const beepAt = (ctx,startAt,freq,dur,volume) => {
+  const osc=ctx.createOscillator(), gain=ctx.createGain();
+  osc.type="sine"; osc.frequency.value=freq;
+  const v=Math.max(0.0001,Math.min(volume,1));
+  gain.gain.setValueAtTime(0.0001,startAt);
+  gain.gain.exponentialRampToValueAtTime(v,startAt+0.02);
+  gain.gain.exponentialRampToValueAtTime(0.0001,startAt+dur);
+  osc.connect(gain); gain.connect(ctx.destination);
+  osc.start(startAt); osc.stop(startAt+dur+0.03);
+};
+const playAlarmSound = (pattern="double",volume=0.6) => {
+  const ctx=getAudioCtx(); if(!ctx) return;
+  const seq=(ALARM_SOUNDS[pattern]||ALARM_SOUNDS.double).seq;
+  let t=ctx.currentTime+0.05;
+  seq.forEach(([freq,dur])=>{ beepAt(ctx,t,freq,dur,volume); t+=dur+0.09; });
+};
+const buzz = (enabled) => { try { if(enabled&&navigator.vibrate) navigator.vibrate([250,120,250]); } catch{} };
+const notify = (enabled,title,body) => {
+  try {
+    if(!enabled) return;
+    if(typeof Notification==="undefined"||Notification.permission!=="granted") return;
+    new Notification(title,{body,tag:"work-tracker-alarm",renotify:true});
+  } catch{}
+};
+const requestNotifyPermission = async () => {
+  try { if(typeof Notification==="undefined") return "unsupported"; if(Notification.permission==="granted") return "granted"; return await Notification.requestPermission(); }
+  catch { return "denied"; }
+};
+/* Human label for an offset relative to the 8h30m target */
+const offsetLabel = (min) => {
+  if(min===0) return "Exactly at 8h 30m";
+  if(min<0) return `${Math.abs(min)} min before target`;
+  return `${min} min after target`;
+};
+const ALARM_PRESETS = [
+  { label:"15 min before target", offsetMin:-15, repeatMin:0 },
+  { label:"10 min before target", offsetMin:-10, repeatMin:0 },
+  { label:"Target reached",       offsetMin:0,   repeatMin:0 },
+  { label:"30 min overtime",      offsetMin:30,  repeatMin:0 },
+  { label:"Nag every 30 min",     offsetMin:0,   repeatMin:30 },
+];
 
 /* ---- Firestore hook ---- */
 function useFirestoreState(userId) {
-  const [state,setState]=useState({logs:{},activeTimer:null});
+  const [state,setState]=useState({logs:{},activeTimer:null,settings:DEFAULT_SETTINGS});
   const [loading,setLoading]=useState(true);
   const writeTimer=useRef(null), isLocal=useRef(false);
   useEffect(()=>{
     if(!userId) return;
     const unsub=onSnapshot(doc(db,"users",userId),(snap)=>{
-      if(snap.exists()) { const data=snap.data(); if(!isLocal.current) setState({logs:data.logs||{},activeTimer:data.activeTimer||null}); isLocal.current=false; }
+      if(snap.exists()) {
+        const data=snap.data();
+        if(!isLocal.current) setState({
+          logs:data.logs||{},
+          activeTimer:data.activeTimer||null,
+          settings:{...DEFAULT_SETTINGS,...(data.settings||{})},
+        });
+        isLocal.current=false;
+      }
       setLoading(false);
     },()=>setLoading(false));
     return unsub;
@@ -169,7 +290,7 @@ function useFirestoreState(userId) {
       const next=typeof updater==="function"?updater(prev):updater;
       isLocal.current=true;
       if(writeTimer.current) clearTimeout(writeTimer.current);
-      writeTimer.current=setTimeout(async()=>{ if(!userId) return; try { await setDoc(doc(db,"users",userId),{logs:next.logs,activeTimer:next.activeTimer,updatedAt:serverTimestamp()},{merge:true}); } catch(e){console.error(e);} },500);
+      writeTimer.current=setTimeout(async()=>{ if(!userId) return; try { await setDoc(doc(db,"users",userId),{logs:next.logs,activeTimer:next.activeTimer,settings:next.settings||DEFAULT_SETTINGS,updatedAt:serverTimestamp()},{merge:true}); } catch(e){console.error(e);} },500);
       return next;
     });
   };
@@ -254,17 +375,34 @@ function prettifyAuthError(code) {
    AUTH GATE
    ============================================================ */
 export default function App() {
-  const [user,setUser]=useState(null); const [authLoading,setAuthLoading]=useState(true);
-  useEffect(()=>{ const unsub=onAuthStateChanged(auth,u=>{setUser(u);setAuthLoading(false);}); return unsub; },[]);
+  const [user,setUser]=useState(null);
+  const [userProfile,setUserProfile]=useState(null);
+  const [authLoading,setAuthLoading]=useState(true);
+  useEffect(() => {
+  const unsub = onAuthStateChanged(auth, async (u) => {
+    setUser(u);
+
+    if (u) {
+      const snap = await getDoc(doc(db, "users", u.uid));
+      setUserProfile(snap.exists() ? snap.data() : null);
+    } else {
+      setUserProfile(null);
+    }
+
+    setAuthLoading(false);
+  });
+
+  return unsub;
+  }, []);
   if(authLoading) return <div className="min-h-screen bg-stone-50 flex items-center justify-center"><Loader2 className="w-8 h-8 animate-spin text-emerald-500"/></div>;
   if(!user) return <AuthScreen/>;
-  return <WorkHoursTracker user={user}/>;
+  return <WorkHoursTracker user={user} userProfile={userProfile}/>;
 }
 
 /* ============================================================
    MAIN TRACKER
    ============================================================ */
-function WorkHoursTracker({user}) {
+function WorkHoursTracker({ user, userProfile }) {
   const [state,setState,loadingData]=useFirestoreState(user.uid);
   const [tab,setTab]=useState("dashboard");
   const [now,setNow]=useState(Date.now());
@@ -272,6 +410,9 @@ function WorkHoursTracker({user}) {
   const [confirmCheckout,setConfirmCheckout]=useState(false);
   const [showProfile,setShowProfile]=useState(false);
   const [showMigrate,setShowMigrate]=useState(false);
+  const [ringingAlarm,setRingingAlarm]=useState(null);
+
+  const settings=state.settings||DEFAULT_SETTINGS;
 
   useEffect(()=>{ const id=setInterval(()=>setNow(Date.now()),1000); return ()=>clearInterval(id); },[]);
   useEffect(()=>{
@@ -299,9 +440,9 @@ function WorkHoursTracker({user}) {
   },[activeTimer,now]);
 
   const fySurplus=useMemo(()=>getFYSurplus(state.logs,today),[state.logs]);
-  const leavesUsed=useMemo(()=>getLeavesUsedFY(state.logs,today),[state.logs]);
+  const leavesUsed=useMemo(()=>getLeavesUsedFY(state.logs,today,settings),[state.logs,settings]);
   const leavesRemaining=ANNUAL_LEAVES-leavesUsed;
-  const monthStats=useMemo(()=>getMonthlyStats(state.logs,today.getFullYear(),today.getMonth()),[state.logs]);
+  const monthStats=useMemo(()=>getMonthlyStats(state.logs,today.getFullYear(),today.getMonth(),settings),[state.logs,settings]);
 
   const checkInNow=()=>setState(s=>({...s,activeTimer:{date:tKey,checkInISO:new Date().toISOString()}}));
   const setCheckInTime=(timeStr)=>{ const [h,m]=timeStr.split(":").map(Number); if(isNaN(h)||isNaN(m)) return; const d=new Date(); d.setHours(h,m,0,0); setState(s=>({...s,activeTimer:{date:tKey,checkInISO:d.toISOString()}})); };
@@ -311,13 +452,141 @@ function WorkHoursTracker({user}) {
   const checkOut=()=>performCheckout(new Date());
   const resetDay=()=>{ setState(s=>{ const nl={...s.logs}; delete nl[tKey]; return {...s,logs:nl,activeTimer:null}; }); setConfirmReset(false); };
   const finalizeStaleAt=(mode)=>{ if(!activeTimer) return; if(mode==="discard"){setState(s=>({...s,activeTimer:null}));return;} const ci=new Date(activeTimer.checkInISO); performCheckout(new Date(ci.getTime()+TARGET_MINUTES*60000),activeTimer.date); };
-  const addLeave=(dateStr)=>{ if(!dateStr) return; const d=parseKey(dateStr); if(isOff(d)){alert("That day is already off.");return;} if(state.logs[dateStr]?.status==="working"){alert("That day already has a working log.");return;} if(d<new Date(new Date().setHours(0,0,0,0))){alert("Backfilling past dates is not allowed.");return;} if(leavesRemaining<=0){alert("No leave balance remaining.");return;} setState(s=>({...s,logs:{...s.logs,[dateStr]:{date:dateStr,status:"leave"}}})); };
+  const addLeave=(dateStr)=>{ if(!dateStr) return; const d=parseKey(dateStr); const kind=dayKind(d,state.settings||DEFAULT_SETTINGS); if(kind!=="working"){alert(kind==="holiday"?"That day is already a company holiday — no leave needed.":"That day is already off.");return;} if(state.logs[dateStr]?.status==="working"){alert("That day already has a working log.");return;} if(d<new Date(new Date().setHours(0,0,0,0))){alert("Backfilling past dates is not allowed.");return;} if(leavesRemaining<=0){alert("No leave balance remaining.");return;} setState(s=>({...s,logs:{...s.logs,[dateStr]:{date:dateStr,status:"leave"}}})); };
   const removeLeave=(dateStr)=>setState(s=>{ const nl={...s.logs}; delete nl[dateStr]; return {...s,logs:nl}; });
   const exportCSV=()=>{ const rows=[["Date","Day","Status","Check-in","Check-out","Total Hours","vs Target (min)"]]; Object.values(state.logs).sort((a,b)=>a.date.localeCompare(b.date)).forEach(l=>{ const d=parseKey(l.date); const days=["Sun","Mon","Tue","Wed","Thu","Fri","Sat"]; rows.push([l.date,days[d.getDay()],l.status,l.checkIn?formatTime12(l.checkIn):"",l.checkOut?formatTime12(l.checkOut):"",l.totalMinutes!=null?formatHMNoSign(l.totalMinutes):"",l.status==="working"?(l.totalMinutes-TARGET_MINUTES):""]); }); const csv=rows.map(r=>r.map(c=>`"${String(c).replace(/"/g,'""')}"`).join(",")).join("\n"); const a=document.createElement("a"); a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv"})); a.download=`work-tracker-${tKey}.csv`; a.click(); };
 
-  const todayKind=dayKind(today);
+  /* ---- Settings mutations ---- */
+  const updateSettings=(patch)=>setState(s=>({...s,settings:{...DEFAULT_SETTINGS,...(s.settings||{}),...patch}}));
+
+  // Toggle whether a given month's 1st Saturday is a holiday or a working day
+  const toggleFirstSat=(year,month)=>setState(s=>{
+    const cur={...DEFAULT_SETTINGS,...(s.settings||{})};
+    const ov={...(cur.firstSatOverrides||{})}, k=monthKeyOf(year,month);
+    if(ov[k]==="working") delete ov[k]; else ov[k]="working";
+    return {...s,settings:{...cur,firstSatOverrides:ov}};
+  });
+
+  const addCompanyHoliday=(dateStr,label)=>{
+    if(!dateStr) return;
+    const d=parseKey(dateStr);
+    if(d.getDay()===0){ alert("Sundays are already off."); return; }
+    if(state.logs[dateStr]?.status==="working"){ alert("That day already has a working log. Reset it from History first."); return; }
+    setState(s=>{
+      const cur={...DEFAULT_SETTINGS,...(s.settings||{})};
+      const nextLogs={...s.logs};
+      // If a personal leave was booked that day, free it back up — holidays don't burn quota
+      if(nextLogs[dateStr]?.status==="leave") delete nextLogs[dateStr];
+      return {...s,logs:nextLogs,settings:{...cur,companyHolidays:{...(cur.companyHolidays||{}),[dateStr]:{label:(label||"").trim()||"Company holiday"}}}};
+    });
+  };
+  const removeCompanyHoliday=(dateStr)=>setState(s=>{
+    const cur={...DEFAULT_SETTINGS,...(s.settings||{})};
+    const ch={...(cur.companyHolidays||{})}; delete ch[dateStr];
+    return {...s,settings:{...cur,companyHolidays:ch}};
+  });
+
+  /* ---- Alarm CRUD ---- */
+  const addAlarm=(alarm)=>setState(s=>{
+    const cur={...DEFAULT_SETTINGS,...(s.settings||{})};
+    const list=[...(cur.alarms||[])];
+    if(list.some(a=>a.offsetMin===alarm.offsetMin&&(a.repeatMin||0)===(alarm.repeatMin||0))) return s;
+    list.push({id:`al_${Date.now()}_${Math.floor(Math.random()*1000)}`,enabled:true,repeatMin:0,...alarm});
+    list.sort((a,b)=>a.offsetMin-b.offsetMin);
+    return {...s,settings:{...cur,alarms:list}};
+  });
+  const updateAlarm=(id,patch)=>setState(s=>{
+    const cur={...DEFAULT_SETTINGS,...(s.settings||{})};
+    return {...s,settings:{...cur,alarms:(cur.alarms||[]).map(a=>a.id===id?{...a,...patch}:a)}};
+  });
+  const removeAlarm=(id)=>setState(s=>{
+    const cur={...DEFAULT_SETTINGS,...(s.settings||{})};
+    return {...s,settings:{...cur,alarms:(cur.alarms||[]).filter(a=>a.id!==id)}};
+  });
+
+  /* ---- Alarm firing engine ----
+     Runs off the same 1s tick as the timer. Everything is computed against
+     real wall-clock time, so a throttled background tab just fires late
+     rather than drifting or skipping. */
+  const firedRef=useRef({});          // "checkInISO|alarmId" -> next repeat index
+  const [snoozes,setSnoozes]=useState([]);   // [{id, at, label}]
+
+  const ring=useCallback((label,detail)=>{
+    playAlarmSound(settings.alarmSound,settings.alarmVolume);
+    buzz(settings.vibrate);
+    notify(settings.notify,label,detail);
+    setRingingAlarm({label,detail,at:Date.now()});
+  },[settings.alarmSound,settings.alarmVolume,settings.vibrate,settings.notify]);
+
+  useEffect(()=>{
+    if(!activeTimer||activeTimer.date!==tKey) return;
+    const checkIn=new Date(activeTimer.checkInISO).getTime();
+    const alarms=settings.alarms||[];
+
+    let rangThisTick=false;    // never stack two beeps on the same second
+
+    alarms.forEach(a=>{
+      if(!a.enabled) return;
+      const key=`${activeTimer.checkInISO}|${a.id}`;
+      const repeat=Number(a.repeatMin)||0;
+      let idx=firedRef.current[key]||0;
+      if(!repeat&&idx>0) return;        // one-shot alarm already handled
+      const base=checkIn+(TARGET_MINUTES+Number(a.offsetMin||0))*60000;
+
+      // walk forward through any occurrences that are already due
+      for(let guard=0;guard<500;guard++){
+        const fireAt=base+(repeat?idx*repeat*60000:0);
+        if(now<fireAt) break;
+        const late=now-fireAt;
+        firedRef.current[key]=idx+1;
+        if(late<ALARM_GRACE_MS){
+          if(!rangThisTick){
+            rangThisTick=true;
+            const worked=Math.round((now-checkIn)/60000);
+            ring(a.label||offsetLabel(a.offsetMin),`${formatHMNoSign(worked)} worked today.`);
+          }
+          break;
+        }
+        if(!repeat) break;     // one-shot that's long past → mark done silently
+        idx=idx+1;
+      }
+    });
+
+    // snoozed alarms
+    if(snoozes.length){
+      const due=snoozes.filter(s=>now>=s.at);
+      if(due.length){
+        setSnoozes(prev=>prev.filter(s=>now<s.at));
+        ring(due[0].label,"Snoozed reminder.");
+      }
+    }
+  },[now,activeTimer,tKey,settings.alarms,snoozes,ring]);
+
+  const snoozeAlarm=(mins)=>{
+    if(ringingAlarm) setSnoozes(prev=>[...prev,{id:`sn_${Date.now()}`,at:Date.now()+mins*60000,label:ringingAlarm.label}]);
+    setRingingAlarm(null);
+  };
+
+  // Next upcoming alarm, for the dashboard hint
+  const nextAlarm=useMemo(()=>{
+    if(!activeTimer||activeTimer.date!==tKey) return null;
+    const checkIn=new Date(activeTimer.checkInISO).getTime();
+    let best=null;
+    (settings.alarms||[]).filter(a=>a.enabled).forEach(a=>{
+      const repeat=Number(a.repeatMin)||0;
+      const base=checkIn+(TARGET_MINUTES+Number(a.offsetMin||0))*60000;
+      let at=base;
+      if(repeat&&now>=base) at=base+Math.ceil((now-base)/(repeat*60000))*repeat*60000;
+      if(at>now&&(!best||at<best.at)) best={at,label:a.label||offsetLabel(a.offsetMin)};
+    });
+    return best;
+  },[activeTimer,tKey,settings.alarms,now]);
+
+  const todayKind=dayKind(today,settings);
+  const firstSatWorking=isFirstSatDate(today)&&todayKind==="working";
   let todayState;
   if(todayKind==="sunday") todayState="off-sunday";
+  else if(todayKind==="holiday") todayState="off-holiday";
   else if(todayKind==="first-sat") todayState="off-firstsat";
   else if(todayLog?.status==="leave") todayState="leave";
   else if(todayLog?.status==="working") todayState="completed";
@@ -343,7 +612,15 @@ function WorkHoursTracker({user}) {
         </header>
 
         <nav className="flex items-center gap-1 mb-6 overflow-x-auto -mx-4 px-4 sm:mx-0 sm:px-0">
-          {[{id:"dashboard",label:"Dashboard",icon:Home},{id:"calendar",label:"Calendar",icon:CalendarIcon},{id:"leaves",label:"Leaves",icon:Palmtree},{id:"history",label:"History",icon:HistoryIcon},{id:"analytics",label:"Analytics",icon:BarChart3}].map(({id,label,icon:Icon})=>(
+          {[
+            {id:"dashboard",label:"Dashboard",icon:Home},
+            {id:"calendar",label:"Calendar",icon:CalendarIcon},
+            {id:"leaves",label:"Leaves",icon:Palmtree},
+            {id:"history",label:"History",icon:HistoryIcon},
+            {id:"analytics",label:"Analytics",icon:BarChart3},
+            {id:"settings",label:"Settings",icon:SettingsIcon},
+            ...(userProfile?.role==="admin" ? [{id:"admin",label:"Admin",icon:User}] : [])
+          ].map(({id,label,icon:Icon})=>(
             <button key={id} onClick={()=>setTab(id)} className={`flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold whitespace-nowrap transition ${tab===id?"bg-slate-900 text-white shadow-sm":"text-slate-600 hover:bg-slate-100"}`}><Icon className="w-4 h-4"/>{label}</button>
           ))}
         </nav>
@@ -362,11 +639,13 @@ function WorkHoursTracker({user}) {
           </div>
         )}
 
-        {tab==="dashboard"&&<DashboardView today={today} todayState={todayState} todayLog={todayLog} activeTimer={activeTimer} liveTimer={liveTimer} monthStats={monthStats} leavesUsed={leavesUsed} leavesRemaining={leavesRemaining} fySurplus={fySurplus} logs={state.logs} checkInNow={checkInNow} setCheckInTime={setCheckInTime} setCheckoutTime={setCheckoutTime} checkOut={()=>setConfirmCheckout(true)} resetDay={()=>setConfirmReset(true)} goToLeaves={()=>setTab("leaves")} goToHistory={()=>setTab("history")}/>}
-        {tab==="calendar"&&<CalendarView logs={state.logs} todayKey={tKey}/>}
-        {tab==="leaves"&&<LeavesView logs={state.logs} leavesUsed={leavesUsed} leavesRemaining={leavesRemaining} addLeave={addLeave} removeLeave={removeLeave}/>}
+        {tab==="dashboard"&&<DashboardView today={today} todayState={todayState} todayLog={todayLog} activeTimer={activeTimer} liveTimer={liveTimer} monthStats={monthStats} leavesUsed={leavesUsed} leavesRemaining={leavesRemaining} fySurplus={fySurplus} logs={state.logs} settings={settings} nextAlarm={nextAlarm} firstSatWorking={firstSatWorking} toggleFirstSat={()=>toggleFirstSat(today.getFullYear(),today.getMonth())} checkInNow={checkInNow} setCheckInTime={setCheckInTime} setCheckoutTime={setCheckoutTime} checkOut={()=>setConfirmCheckout(true)} resetDay={()=>setConfirmReset(true)} goToLeaves={()=>setTab("leaves")} goToHistory={()=>setTab("history")} goToSettings={()=>setTab("settings")}/>}
+        {tab==="calendar"&&<CalendarView logs={state.logs} todayKey={tKey} settings={settings} toggleFirstSat={toggleFirstSat} addCompanyHoliday={addCompanyHoliday} removeCompanyHoliday={removeCompanyHoliday}/>}
+        {tab==="leaves"&&<LeavesView logs={state.logs} settings={settings} leavesUsed={leavesUsed} leavesRemaining={leavesRemaining} addLeave={addLeave} removeLeave={removeLeave}/>}
         {tab==="history"&&<HistoryView logs={state.logs} exportCSV={exportCSV}/>}
-        {tab==="analytics"&&<AnalyticsView logs={state.logs} fySurplus={fySurplus}/>}
+        {tab==="analytics"&&<AnalyticsView logs={state.logs} fySurplus={fySurplus} settings={settings}/>}
+        {tab==="settings"&&<SettingsView settings={settings} updateSettings={updateSettings} toggleFirstSat={toggleFirstSat} addCompanyHoliday={addCompanyHoliday} removeCompanyHoliday={removeCompanyHoliday} addAlarm={addAlarm} updateAlarm={updateAlarm} removeAlarm={removeAlarm}/>}
+        {tab==="admin"&&<AdminView currentUserProfile={userProfile}/>}
 
         <footer className="mt-10 pt-6 border-t border-slate-200 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-xs text-slate-500">
           <div className="flex items-center gap-2"><Sparkles className="w-3.5 h-3.5 text-amber-500"/><span>Synced to cloud · {fyLabel(today)}</span></div>
@@ -386,6 +665,21 @@ function WorkHoursTracker({user}) {
           <p className="text-sm text-slate-600">This clears today's check-in, check-out and total hours.</p>
           <div className="flex gap-2 mt-5"><button onClick={()=>setConfirmReset(false)} className="flex-1 px-4 py-2.5 rounded-xl border border-slate-200 font-semibold text-sm">Cancel</button><button onClick={resetDay} className="flex-1 px-4 py-2.5 rounded-xl bg-rose-500 text-white font-semibold text-sm">Reset</button></div>
         </Modal>
+        <Modal open={!!ringingAlarm} onClose={()=>setRingingAlarm(null)} title="Alarm">
+          {ringingAlarm&&(
+            <div>
+              <div className="flex items-center gap-3 mb-4">
+                <div className="w-12 h-12 rounded-2xl bg-amber-100 grid place-items-center shrink-0"><Bell className="w-6 h-6 text-amber-600"/></div>
+                <div className="min-w-0"><p className="font-bold text-slate-900">{ringingAlarm.label}</p><p className="text-xs text-slate-500 mt-0.5">{ringingAlarm.detail}</p></div>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <button onClick={()=>snoozeAlarm(5)} className="px-4 py-2.5 rounded-xl border border-slate-200 font-semibold text-sm">Snooze 5 min</button>
+                <button onClick={()=>setRingingAlarm(null)} className="px-4 py-2.5 rounded-xl bg-slate-900 text-white font-semibold text-sm">Dismiss</button>
+              </div>
+              <button onClick={()=>{setRingingAlarm(null);setConfirmCheckout(true);}} className="w-full mt-2 px-4 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-600 text-white font-semibold text-sm">Check out now</button>
+            </div>
+          )}
+        </Modal>
         <Modal open={confirmCheckout} onClose={()=>setConfirmCheckout(false)} title="Check out now?">
           {liveTimer&&(<div className="text-sm text-slate-600"><p>You'll log <span className="font-bold text-slate-900">{formatHMNoSign(liveTimer.elapsedMin)}</span> for today.</p>{liveTimer.elapsedMin<TARGET_MINUTES&&<p className="mt-2 text-rose-600 font-medium">Deficit of {formatHMNoSign(TARGET_MINUTES-liveTimer.elapsedMin)}.</p>}{liveTimer.elapsedMin>TARGET_MINUTES&&<p className="mt-2 text-emerald-600 font-medium">Surplus of {formatHMNoSign(liveTimer.elapsedMin-TARGET_MINUTES)}.</p>}</div>)}
           <div className="flex gap-2 mt-5"><button onClick={()=>setConfirmCheckout(false)} className="flex-1 px-4 py-2.5 rounded-xl border border-slate-200 font-semibold text-sm">Cancel</button><button onClick={()=>{checkOut();setConfirmCheckout(false);}} className="flex-1 px-4 py-2.5 rounded-xl bg-slate-900 text-white font-semibold text-sm">Check out</button></div>
@@ -398,20 +692,20 @@ function WorkHoursTracker({user}) {
 /* ============================================================
    DASHBOARD VIEW
    ============================================================ */
-function DashboardView({today,todayState,todayLog,activeTimer,liveTimer,monthStats,leavesUsed,leavesRemaining,fySurplus,logs,checkInNow,setCheckInTime,setCheckoutTime,checkOut,resetDay,goToLeaves,goToHistory}) {
+function DashboardView({today,todayState,todayLog,activeTimer,liveTimer,monthStats,leavesUsed,leavesRemaining,fySurplus,logs,settings,nextAlarm,firstSatWorking,toggleFirstSat,checkInNow,setCheckInTime,setCheckoutTime,checkOut,resetDay,goToLeaves,goToHistory,goToSettings}) {
   const [showCheckinPicker,setShowCheckinPicker]=useState(false);
   const [manualTime,setManualTime]=useState(()=>{ const d=new Date(); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; });
   const recent=useMemo(()=>Object.values(logs).filter(l=>l.date!==todayKey()).sort((a,b)=>b.date.localeCompare(a.date)).slice(0,5),[logs]);
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
       <div className="lg:col-span-2 space-y-5">
-        <TimerCard today={today} todayState={todayState} todayLog={todayLog} liveTimer={liveTimer} checkInNow={checkInNow} setCheckInTime={setCheckInTime} setCheckoutTime={setCheckoutTime} checkOut={checkOut} resetDay={resetDay} showCheckinPicker={showCheckinPicker} setShowCheckinPicker={setShowCheckinPicker} manualTime={manualTime} setManualTime={setManualTime}/>
+        <TimerCard today={today} todayState={todayState} todayLog={todayLog} liveTimer={liveTimer} settings={settings} nextAlarm={nextAlarm} firstSatWorking={firstSatWorking} toggleFirstSat={toggleFirstSat} goToSettings={goToSettings} checkInNow={checkInNow} setCheckInTime={setCheckInTime} setCheckoutTime={setCheckoutTime} checkOut={checkOut} resetDay={resetDay} showCheckinPicker={showCheckinPicker} setShowCheckinPicker={setShowCheckinPicker} manualTime={manualTime} setManualTime={setManualTime}/>
         <section className="rounded-3xl bg-white border border-slate-200 p-5">
           <div className="flex items-center justify-between mb-4"><div><h2 className="font-bold text-slate-900">Monthly Summary</h2><p className="text-xs text-slate-500 mt-0.5">{monthLabel(today.getFullYear(),today.getMonth())}</p></div><button onClick={goToHistory} className="text-xs font-semibold text-emerald-600">View all →</button></div>
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
             <Tile label="Working Days" value={monthStats.totalWorkingDays} sub="this month" tone="sky" icon={CalendarIcon}/>
             <Tile label="Days Worked" value={monthStats.workedDays} sub={`of ${monthStats.totalWorkingDays}`} tone="emerald" icon={CheckCircle2}/>
-            <Tile label="Leaves Taken" value={monthStats.leavesTaken} sub="this month" tone="amber" icon={Palmtree}/>
+            <Tile label="Leaves Taken" value={monthStats.leavesTaken} sub={monthStats.companyHolidays>0?`+${monthStats.companyHolidays} co. holiday${monthStats.companyHolidays>1?"s":""}`:"this month"} tone="amber" icon={Palmtree}/>
             <Tile label="Total Hours" value={formatHMNoSign(monthStats.totalMinutes)} sub={`avg ${formatHMNoSign(monthStats.avgPerDay)}/day`} tone="violet" icon={Clock}/>
           </div>
           <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -444,15 +738,34 @@ function DashboardView({today,todayState,todayLog,activeTimer,liveTimer,monthSta
 /* ============================================================
    TIMER CARD — with Set Checkout Time
    ============================================================ */
-function TimerCard({today,todayState,todayLog,liveTimer,checkInNow,setCheckInTime,setCheckoutTime,checkOut,resetDay,showCheckinPicker,setShowCheckinPicker,manualTime,setManualTime}) {
+function TimerCard({today,todayState,todayLog,liveTimer,settings,nextAlarm,firstSatWorking,toggleFirstSat,goToSettings,checkInNow,setCheckInTime,setCheckoutTime,checkOut,resetDay,showCheckinPicker,setShowCheckinPicker,manualTime,setManualTime}) {
   const [showCheckoutPicker,setShowCheckoutPicker]=useState(false);
   const [checkoutTimeLocal,setCheckoutTimeLocal]=useState(()=>{ const d=new Date(); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; });
 
-  if(todayState==="off-sunday"||todayState==="off-firstsat") return (
+  if(todayState==="off-sunday") return (
     <section className="rounded-3xl bg-gradient-to-br from-slate-100 to-slate-50 border border-slate-200 p-6">
       <div className="mb-3"><Pill tone="slate">Off Day</Pill></div>
-      <h2 className="text-2xl font-bold text-slate-900">{todayState==="off-sunday"?"Sunday off":"First Saturday off"}</h2>
+      <h2 className="text-2xl font-bold text-slate-900">Sunday off</h2>
       <p className="text-sm text-slate-500 mt-1">No work expected today. Recharge.</p>
+    </section>
+  );
+  if(todayState==="off-holiday") return (
+    <section className="rounded-3xl bg-gradient-to-br from-sky-50 to-sky-100/40 border border-sky-200 p-6">
+      <div className="mb-3"><Pill tone="sky">Company Holiday</Pill></div>
+      <h2 className="text-2xl font-bold text-slate-900">{holidayLabel(today,settings)}</h2>
+      <p className="text-sm text-slate-500 mt-1">Declared by the company — this does not touch your leave quota.</p>
+    </section>
+  );
+  if(todayState==="off-firstsat") return (
+    <section className="rounded-3xl bg-gradient-to-br from-slate-100 to-slate-50 border border-slate-200 p-6">
+      <div className="mb-3"><Pill tone="slate">Off Day</Pill></div>
+      <h2 className="text-2xl font-bold text-slate-900">First Saturday off</h2>
+      <p className="text-sm text-slate-500 mt-1">No work expected today. Recharge.</p>
+      <div className="mt-5 pt-4 border-t border-slate-200">
+        <p className="text-xs text-slate-500 mb-2">Called in to work anyway?</p>
+        <button onClick={toggleFirstSat} className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-white border border-slate-300 font-semibold text-sm text-slate-700 hover:bg-slate-50"><Briefcase className="w-4 h-4"/> I'm working today</button>
+        <p className="text-[11px] text-slate-400 mt-2">Applies only to this month's 1st Saturday. The default rule stays intact.</p>
+      </div>
     </section>
   );
   if(todayState==="leave") return (
@@ -500,6 +813,13 @@ function TimerCard({today,todayState,todayLog,liveTimer,checkInNow,setCheckInTim
         <div className="mt-6 space-y-3">
           <div className="flex items-center justify-between py-2 border-t border-emerald-200/60"><span className="text-sm text-slate-600">Check-in Time</span><span className="font-semibold text-slate-900 font-mono text-sm">{formatTime12(checkIn)}</span></div>
           <div className="flex items-center justify-between py-2 border-t border-emerald-200/60"><span className="text-sm text-slate-600">Expected Check-out</span><span className="font-semibold text-slate-900 font-mono text-sm">{formatTime12(expectedCheckout)}</span></div>
+          <div className="flex items-center justify-between py-2 border-t border-emerald-200/60">
+            <span className="text-sm text-slate-600 flex items-center gap-1.5">{nextAlarm?<Bell className="w-3.5 h-3.5 text-amber-500"/>:<BellOff className="w-3.5 h-3.5 text-slate-300"/>}Next alarm</span>
+            {nextAlarm
+              ? <span className="font-semibold text-slate-900 font-mono text-sm">{formatTime12(new Date(nextAlarm.at))}</span>
+              : <button onClick={goToSettings} className="text-xs font-semibold text-emerald-600">Set one →</button>}
+          </div>
+          {nextAlarm&&<p className="text-[11px] text-slate-400 -mt-1">{nextAlarm.label}</p>}
         </div>
         {/* ── Set Checkout Time picker ── */}
         {showCheckoutPicker?(
@@ -527,6 +847,12 @@ function TimerCard({today,todayState,todayLog,liveTimer,checkInNow,setCheckInTim
       <div className="flex items-center justify-between mb-4"><Pill tone="slate">Not Checked In</Pill><span className="text-xs font-medium text-slate-500">{longDate(today)}</span></div>
       <h2 className="text-2xl font-bold text-slate-900">Ready to start your day?</h2>
       <p className="text-sm text-slate-500 mt-1 mb-6">Check in to begin tracking. Target: 8h 30m.</p>
+      {firstSatWorking&&(
+        <div className="mb-5 rounded-2xl border border-sky-200 bg-sky-50 p-3 flex items-center justify-between gap-3">
+          <p className="text-xs text-sky-800 font-medium">1st Saturday — marked as a <span className="font-bold">working day</span> for this month.</p>
+          <button onClick={toggleFirstSat} className="shrink-0 px-3 py-1.5 rounded-lg bg-white border border-sky-300 text-sky-700 text-xs font-semibold">Undo</button>
+        </div>
+      )}
       {showCheckinPicker?(
         <div className="space-y-3">
           <label className="block text-xs font-semibold text-slate-700">Check-in time</label>
@@ -553,8 +879,10 @@ function RecentRow({log}) {
 /* ============================================================
    CALENDAR VIEW
    ============================================================ */
-function CalendarView({logs,todayKey:tKey}) {
+function CalendarView({logs,todayKey:tKey,settings,toggleFirstSat,addCompanyHoliday,removeCompanyHoliday}) {
   const [cursor,setCursor]=useState(()=>{ const t=new Date(); return {year:t.getFullYear(),month:t.getMonth()}; });
+  const [selected,setSelected]=useState(null);      // Date object
+  const [holidayLabelInput,setHolidayLabelInput]=useState("");
   const today=new Date(), {year,month}=cursor;
   const firstDay=new Date(year,month,1), startOffset=(firstDay.getDay()+6)%7, lastDay=new Date(year,month+1,0).getDate();
   const cells=[]; const prevLast=new Date(year,month,0).getDate();
@@ -562,7 +890,10 @@ function CalendarView({logs,todayKey:tKey}) {
   for(let d=1;d<=lastDay;d++) cells.push({day:d,inMonth:true,date:new Date(year,month,d)});
   while(cells.length%7!==0||cells.length<42) { const idx=cells.length-lastDay-startOffset+1; cells.push({day:idx,inMonth:false,date:new Date(year,month+1,idx)}); if(cells.length>=42) break; }
   const navigate=(delta)=>{ const nm=month+delta; if(nm<0) setCursor({year:year-1,month:11}); else if(nm>11) setCursor({year:year+1,month:0}); else setCursor({year,month:nm}); };
-  const monthStats=useMemo(()=>getMonthlyStats(logs,year,month),[logs,year,month]);
+  const monthStats=useMemo(()=>getMonthlyStats(logs,year,month,settings),[logs,year,month,settings]);
+  const selKind=selected?dayKind(selected,settings):null;
+  const selKey=selected?dateKey(selected):null;
+  const selLog=selKey?logs[selKey]:null;
   return (
     <div className="space-y-5">
       <div className="rounded-3xl bg-white border border-slate-200 p-5">
@@ -572,13 +903,64 @@ function CalendarView({logs,todayKey:tKey}) {
         </div>
         <div className="grid grid-cols-7 mb-2">{["Mon","Tue","Wed","Thu","Fri","Sat","Sun"].map(d=><div key={d} className="text-center text-[11px] font-bold uppercase tracking-wider text-slate-400 py-2">{d}</div>)}</div>
         <div className="grid grid-cols-7 gap-1.5">
-          {cells.map((c,i)=>{ const k=dateKey(c.date),log=logs[k],kind=dayKind(c.date),isToday=k===tKey; let bg="bg-white border-slate-100",textColor="text-slate-700",label=null; if(!c.inMonth){bg="bg-transparent border-transparent";textColor="text-slate-300";}else if(log?.status==="leave"){bg="bg-amber-100 border-amber-200";textColor="text-amber-800";label="L";}else if(log?.status==="working"){const s=log.totalMinutes-TARGET_MINUTES;bg=s>=0?"bg-emerald-100 border-emerald-200":"bg-rose-100 border-rose-200";textColor=s>=0?"text-emerald-800":"text-rose-800";}else if(kind==="sunday"){bg="bg-rose-50/40 border-rose-100";textColor="text-rose-400";}else if(kind==="first-sat"){bg="bg-amber-50/40 border-amber-100";textColor="text-amber-500";}
-            return (<div key={i} className={`aspect-square rounded-xl border ${bg} ${textColor} flex flex-col items-center justify-center text-sm font-semibold relative ${isToday?"ring-2 ring-slate-900 ring-offset-1":""}`}><span>{c.day}</span>{label&&<span className="text-[9px] absolute bottom-1 font-bold">{label}</span>}</div>);
+          {cells.map((c,i)=>{ const k=dateKey(c.date),log=logs[k],kind=dayKind(c.date,settings),isToday=k===tKey,isSel=selKey===k&&c.inMonth; let bg="bg-white border-slate-100",textColor="text-slate-700",label=null;
+            if(!c.inMonth){bg="bg-transparent border-transparent";textColor="text-slate-300";}
+            else if(log?.status==="working"){const s=log.totalMinutes-TARGET_MINUTES;bg=s>=0?"bg-emerald-100 border-emerald-200":"bg-rose-100 border-rose-200";textColor=s>=0?"text-emerald-800":"text-rose-800";}
+            else if(kind==="holiday"){bg="bg-sky-100 border-sky-300";textColor="text-sky-800";label="H";}
+            else if(log?.status==="leave"){bg="bg-amber-100 border-amber-200";textColor="text-amber-800";label="L";}
+            else if(kind==="sunday"){bg="bg-rose-50/40 border-rose-100";textColor="text-rose-400";}
+            else if(kind==="first-sat"){bg="bg-amber-50/40 border-amber-100";textColor="text-amber-500";}
+            else if(isFirstSatDate(c.date)){bg="bg-white border-sky-200";textColor="text-slate-700";label="W";}
+            return (<button key={i} type="button" disabled={!c.inMonth} onClick={()=>{setSelected(c.date);setHolidayLabelInput("");}} className={`aspect-square rounded-xl border ${bg} ${textColor} flex flex-col items-center justify-center text-sm font-semibold relative ${isToday?"ring-2 ring-slate-900 ring-offset-1":""} ${isSel?"ring-2 ring-sky-500 ring-offset-1":""} ${c.inMonth?"hover:brightness-95 cursor-pointer":"cursor-default"}`}><span>{c.day}</span>{label&&<span className="text-[9px] absolute bottom-1 font-bold">{label}</span>}</button>);
           })}
         </div>
-        <div className="flex flex-wrap gap-x-4 gap-y-2 mt-5 pt-4 border-t border-slate-100 text-xs text-slate-600">{[{c:"bg-emerald-400",l:"Worked (met)"},{c:"bg-rose-400",l:"Worked (deficit)"},{c:"bg-amber-300",l:"Leave"},{c:"bg-rose-200",l:"Sunday"},{c:"bg-amber-200",l:"1st Saturday"}].map(({c,l})=><div key={l} className="flex items-center gap-1.5"><span className={`w-2.5 h-2.5 rounded-full ${c}`}></span><span>{l}</span></div>)}</div>
+        <div className="flex flex-wrap gap-x-4 gap-y-2 mt-5 pt-4 border-t border-slate-100 text-xs text-slate-600">{[{c:"bg-emerald-400",l:"Worked (met)"},{c:"bg-rose-400",l:"Worked (deficit)"},{c:"bg-amber-300",l:"Leave"},{c:"bg-sky-400",l:"Company holiday"},{c:"bg-rose-200",l:"Sunday"},{c:"bg-amber-200",l:"1st Saturday off"},{c:"bg-white border border-sky-300",l:"1st Sat — working"}].map(({c,l})=><div key={l} className="flex items-center gap-1.5"><span className={`w-2.5 h-2.5 rounded-full ${c}`}></span><span>{l}</span></div>)}</div>
+        <p className="text-[11px] text-slate-400 mt-3">Tap any day to mark it as a company holiday or flip a 1st Saturday.</p>
       </div>
-      <div className="rounded-3xl bg-white border border-slate-200 p-5"><h3 className="font-bold text-slate-900 mb-3">Summary · {monthLabel(year,month)}</h3><div className="grid grid-cols-2 sm:grid-cols-4 gap-3"><Tile label="Working Days" value={monthStats.totalWorkingDays} tone="sky"/><Tile label="Worked" value={monthStats.workedDays} tone="emerald"/><Tile label="Leaves" value={monthStats.leavesTaken} tone="amber"/><Tile label="Total Hours" value={formatHMNoSign(monthStats.totalMinutes)} tone="violet"/></div></div>
+
+      {/* ── Day editor ── */}
+      {selected&&(
+        <div className="rounded-3xl bg-white border border-slate-200 p-5">
+          <div className="flex items-start justify-between mb-4">
+            <div>
+              <h3 className="font-bold text-slate-900">{longDate(selected)}</h3>
+              <p className="text-xs text-slate-500 mt-0.5">
+                {selKind==="sunday"?"Weekly off (Sunday)":selKind==="holiday"?holidayLabel(selected,settings):selKind==="first-sat"?"1st Saturday — off":selLog?.status==="leave"?"Personal leave":selLog?.status==="working"?`Worked ${formatHMNoSign(selLog.totalMinutes)}`:"Regular working day"}
+              </p>
+            </div>
+            <button onClick={()=>setSelected(null)} className="p-1.5 rounded-lg hover:bg-slate-100"><X className="w-4 h-4 text-slate-500"/></button>
+          </div>
+
+          {selKind==="sunday"&&<p className="text-sm text-slate-500">Sundays are always off — nothing to change here.</p>}
+
+          {isFirstSatDate(selected)&&(
+            <div className="rounded-2xl border border-slate-200 p-4 mb-3">
+              <p className="text-sm font-semibold text-slate-800 mb-1">1st Saturday of {monthLabel(selected.getFullYear(),selected.getMonth())}</p>
+              <p className="text-xs text-slate-500 mb-3">{selKind==="first-sat"?"Currently treated as an off day.":"Currently treated as a working day."}</p>
+              <button onClick={()=>toggleFirstSat(selected.getFullYear(),selected.getMonth())} className="px-4 py-2.5 rounded-xl bg-slate-900 text-white font-semibold text-sm">
+                {selKind==="first-sat"?"Mark as working day":"Mark as off day"}
+              </button>
+              <p className="text-[11px] text-slate-400 mt-2">Only affects this month. The default 1st-Saturday-off rule is untouched.</p>
+            </div>
+          )}
+
+          {selKind==="holiday"?(
+            <div className="rounded-2xl border border-sky-200 bg-sky-50 p-4">
+              <p className="text-sm font-semibold text-sky-900 mb-1">Company holiday</p>
+              <p className="text-xs text-sky-700 mb-3">{holidayLabel(selected,settings)} · not deducted from your leave quota.</p>
+              <button onClick={()=>{removeCompanyHoliday(selKey);setSelected(null);}} className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-white border border-sky-300 text-sky-700 font-semibold text-sm"><Trash2 className="w-4 h-4"/> Remove holiday</button>
+            </div>
+          ):selKind!=="sunday"&&(
+            <div className="rounded-2xl border border-slate-200 p-4">
+              <p className="text-sm font-semibold text-slate-800 mb-2">Mark as company holiday</p>
+              <input type="text" value={holidayLabelInput} onChange={e=>setHolidayLabelInput(e.target.value)} placeholder="Reason (e.g. Diwali, shifted Saturday)" className="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm focus:outline-none focus:border-sky-500"/>
+              <button onClick={()=>{addCompanyHoliday(selKey,holidayLabelInput);setHolidayLabelInput("");}} className="w-full mt-3 flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-sky-500 hover:bg-sky-600 text-white font-semibold text-sm"><PartyPopper className="w-4 h-4"/> Add company holiday</button>
+              <p className="text-[11px] text-slate-400 mt-2">Company holidays don't touch your 20-leave quota and reduce expected working days.</p>
+            </div>
+          )}
+        </div>
+      )}
+      <div className="rounded-3xl bg-white border border-slate-200 p-5"><h3 className="font-bold text-slate-900 mb-3">Summary · {monthLabel(year,month)}</h3><div className="grid grid-cols-2 sm:grid-cols-5 gap-3"><Tile label="Working Days" value={monthStats.totalWorkingDays} tone="sky"/><Tile label="Worked" value={monthStats.workedDays} tone="emerald"/><Tile label="Leaves" value={monthStats.leavesTaken} tone="amber"/><Tile label="Co. Holidays" value={monthStats.companyHolidays} tone="sky"/><Tile label="Total Hours" value={formatHMNoSign(monthStats.totalMinutes)} tone="violet"/></div></div>
     </div>
   );
 }
@@ -586,10 +968,10 @@ function CalendarView({logs,todayKey:tKey}) {
 /* ============================================================
    LEAVES VIEW
    ============================================================ */
-function LeavesView({logs,leavesUsed,leavesRemaining,addLeave,removeLeave}) {
+function LeavesView({logs,settings,leavesUsed,leavesRemaining,addLeave,removeLeave}) {
   const today=new Date(), [pickDate,setPickDate]=useState(todayKey());
   const fyStart=fyStartFor(today), fyEnd=fyEndFor(today);
-  const leaves=useMemo(()=>Object.values(logs).filter(l=>{ if(l.status!=="leave") return false; const d=parseKey(l.date); return d>=fyStart&&d<=fyEnd; }).sort((a,b)=>a.date.localeCompare(b.date)),[logs]);
+  const leaves=useMemo(()=>Object.values(logs).filter(l=>{ if(l.status!=="leave") return false; const d=parseKey(l.date); return d>=fyStart&&d<=fyEnd&&!isOff(d,settings); }).sort((a,b)=>a.date.localeCompare(b.date)),[logs,settings]);
   const upcoming=leaves.filter(l=>parseKey(l.date)>=new Date(new Date().setHours(0,0,0,0)));
   const past=leaves.filter(l=>parseKey(l.date)<new Date(new Date().setHours(0,0,0,0)));
   return (
@@ -605,7 +987,7 @@ function LeavesView({logs,leavesUsed,leavesRemaining,addLeave,removeLeave}) {
           <label className="block text-xs font-semibold text-slate-700 mb-2">Select date</label>
           <input type="date" value={pickDate} min={todayKey()} onChange={e=>setPickDate(e.target.value)} className="w-full px-4 py-3 rounded-xl border border-slate-200 font-mono focus:outline-none focus:border-emerald-500"/>
           <button onClick={()=>addLeave(pickDate)} className="w-full mt-3 px-4 py-3 rounded-xl bg-emerald-500 hover:bg-emerald-600 text-white font-semibold text-sm flex items-center justify-center gap-2"><Plus className="w-4 h-4"/> Mark as leave</button>
-          <p className="text-[11px] text-slate-500 mt-3">Leaves can't be applied on Sundays, 1st Saturday, or past dates.</p>
+          <p className="text-[11px] text-slate-500 mt-3">Leaves can't be applied on Sundays, off Saturdays, company holidays, or past dates. Company holidays never use up your quota — add those from the Calendar or Settings.</p>
         </div>
       </section>
       <section className="lg:col-span-2 space-y-5">
@@ -640,9 +1022,284 @@ function HistoryView({logs,exportCSV}) {
 }
 
 /* ============================================================
+   ADMIN VIEW
+   ============================================================ */
+function AdminView({ currentUserProfile }) {
+  const [users, setUsers] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    const loadUsers = async () => {
+      try {
+        setError("");
+
+        const snap = await getDocs(collection(db, "users"));
+
+        const list = snap.docs.map((docSnap) => ({
+          id: docSnap.id,
+          ...docSnap.data(),
+        }));
+
+        setUsers(list);
+      } catch (err) {
+        console.error("Failed to load users:", err);
+        setError(err.message || "Failed to load users.");
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    loadUsers();
+  }, [currentUserProfile]);
+
+  if (loading) {
+    return (
+      <div className="rounded-3xl bg-white border border-slate-200 p-5">
+        <p className="text-sm text-slate-500">Loading users...</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="rounded-3xl bg-white border border-slate-200 p-5">
+      <h2 className="font-bold text-slate-900">Admin Dashboard</h2>
+
+      <p className="text-sm text-slate-500 mt-1">
+        Team members in your organization.
+      </p>
+
+      {error && (
+        <p className="text-sm text-rose-600 mt-3">
+          {error}
+        </p>
+      )}
+
+      <div className="mt-5 space-y-3">
+        {users.length === 0 && !error && (
+          <p className="text-sm text-slate-500">
+            No users found for this organization.
+          </p>
+        )}
+
+        {users.map((member) => (
+          <div
+            key={member.id}
+            className="flex items-center justify-between rounded-2xl border border-slate-200 p-4"
+          >
+            <div>
+              <p className="font-semibold text-slate-900">
+                {member.name || member.email || member.id}
+              </p>
+
+              <p className="text-xs text-slate-500">
+                {member.email || "No email saved"}
+              </p>
+            </div>
+
+            <span className="text-xs font-semibold px-2 py-1 rounded-full bg-slate-100 text-slate-600">
+              {member.role || "user"}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   SETTINGS VIEW — Off days + Alarms
+   ============================================================ */
+function SettingsView({settings,updateSettings,toggleFirstSat,addCompanyHoliday,removeCompanyHoliday,addAlarm,updateAlarm,removeAlarm}) {
+  const today=new Date();
+  const [sTab,setSTab]=useState("offdays");
+  const [holDate,setHolDate]=useState(todayKey());
+  const [holLabel,setHolLabel]=useState("");
+  const [customOffset,setCustomOffset]=useState(0);
+  const [customRepeat,setCustomRepeat]=useState(0);
+  const [notifState,setNotifState]=useState(()=>typeof Notification!=="undefined"?Notification.permission:"unsupported");
+
+  const alarms=settings.alarms||[];
+  const holidays=useMemo(()=>Object.entries(settings.companyHolidays||{}).map(([date,v])=>({date,label:v?.label||"Company holiday"})).sort((a,b)=>a.date.localeCompare(b.date)),[settings.companyHolidays]);
+  const fyStart=fyStartFor(today), fyEnd=fyEndFor(today);
+  const upcomingHolidays=holidays.filter(h=>parseKey(h.date)>=new Date(new Date().setHours(0,0,0,0)));
+  const pastHolidays=holidays.filter(h=>parseKey(h.date)<new Date(new Date().setHours(0,0,0,0))&&parseKey(h.date)>=fyStart&&parseKey(h.date)<=fyEnd);
+
+  // Next 12 months of 1st Saturdays for the override list
+  const firstSats=useMemo(()=>{
+    const out=[];
+    for(let i=0;i<12;i++){
+      const d=new Date(today.getFullYear(),today.getMonth()+i,1);
+      const day=firstSaturday(d.getFullYear(),d.getMonth());
+      const date=new Date(d.getFullYear(),d.getMonth(),day);
+      out.push({date,mKey:monthKeyOf(d.getFullYear(),d.getMonth()),working:(settings.firstSatOverrides||{})[monthKeyOf(d.getFullYear(),d.getMonth())]==="working"});
+    }
+    return out;
+  },[settings.firstSatOverrides]);
+
+  const askNotify=async()=>{ const r=await requestNotifyPermission(); setNotifState(r); if(r==="granted") updateSettings({notify:true}); };
+  const tabStyle=(id)=>`px-4 py-2 rounded-xl text-sm font-semibold transition ${sTab===id?"bg-slate-900 text-white":"text-slate-600 hover:bg-slate-100"}`;
+
+  return (
+    <div className="space-y-5">
+      <div className="flex gap-2 bg-slate-100 p-1.5 rounded-2xl w-fit">
+        <button className={tabStyle("offdays")} onClick={()=>setSTab("offdays")}>Off Days</button>
+        <button className={tabStyle("alarms")} onClick={()=>setSTab("alarms")}>Alarms</button>
+      </div>
+
+      {/* ── OFF DAYS ── */}
+      {sTab==="offdays"&&(
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+          <section className="rounded-3xl bg-white border border-slate-200 p-5">
+            <h2 className="font-bold text-slate-900">Add Company Holiday</h2>
+            <p className="text-xs text-slate-500 mt-0.5 mb-4">Declared by the company. Never deducted from your {ANNUAL_LEAVES}-leave quota.</p>
+            <label className="block text-xs font-semibold text-slate-700 mb-2">Date</label>
+            <input type="date" value={holDate} onChange={e=>setHolDate(e.target.value)} className="w-full px-4 py-3 rounded-xl border border-slate-200 font-mono focus:outline-none focus:border-sky-500"/>
+            <label className="block text-xs font-semibold text-slate-700 mb-2 mt-3">Reason (optional)</label>
+            <input type="text" value={holLabel} onChange={e=>setHolLabel(e.target.value)} placeholder="Diwali, shifted Saturday, founder's day…" className="w-full px-4 py-3 rounded-xl border border-slate-200 text-sm focus:outline-none focus:border-sky-500"/>
+            <button onClick={()=>{addCompanyHoliday(holDate,holLabel);setHolLabel("");}} className="w-full mt-3 px-4 py-3 rounded-xl bg-sky-500 hover:bg-sky-600 text-white font-semibold text-sm flex items-center justify-center gap-2"><PartyPopper className="w-4 h-4"/> Add holiday</button>
+            <p className="text-[11px] text-slate-500 mt-3">Past dates are allowed here — useful for backfilling holidays the company announced earlier.</p>
+          </section>
+
+          <section className="rounded-3xl bg-white border border-slate-200 p-5">
+            <h2 className="font-bold text-slate-900">1st Saturday Rule</h2>
+            <p className="text-xs text-slate-500 mt-0.5 mb-4">The 1st Saturday of every month is off by default. Flip any single month without changing the rule.</p>
+            <div className="max-h-[340px] overflow-y-auto divide-y divide-slate-100 -mx-1 px-1">
+              {firstSats.map(fs=>(
+                <div key={fs.mKey} className="flex items-center justify-between py-2.5">
+                  <div>
+                    <p className="text-sm font-semibold text-slate-900">{compactDate(fs.date)} {fs.date.getFullYear()}</p>
+                    <p className={`text-[11px] font-medium mt-0.5 ${fs.working?"text-sky-600":"text-slate-500"}`}>{fs.working?"Working day":"Off day"}</p>
+                  </div>
+                  <button onClick={()=>toggleFirstSat(fs.date.getFullYear(),fs.date.getMonth())} className={`px-3 py-1.5 rounded-lg text-xs font-semibold border ${fs.working?"bg-white border-slate-300 text-slate-700":"bg-sky-500 border-sky-500 text-white"}`}>
+                    {fs.working?"Mark off":"Mark working"}
+                  </button>
+                </div>
+              ))}
+            </div>
+          </section>
+
+          <section className="rounded-3xl bg-white border border-slate-200 p-5 lg:col-span-2">
+            <h2 className="font-bold text-slate-900 mb-3">Upcoming Company Holidays</h2>
+            {upcomingHolidays.length===0?<p className="text-sm text-slate-500 py-6 text-center">None scheduled.</p>:(
+              <ul className="divide-y divide-slate-100">
+                {upcomingHolidays.map(h=>(
+                  <li key={h.date} className="flex items-center justify-between py-3">
+                    <div><p className="font-semibold text-sm text-slate-900">{shortDate(parseKey(h.date))}</p><p className="text-xs text-slate-500 mt-0.5">{h.label}</p></div>
+                    <button onClick={()=>removeCompanyHoliday(h.date)} className="p-2 rounded-lg hover:bg-rose-50 text-rose-500"><Trash2 className="w-4 h-4"/></button>
+                  </li>
+                ))}
+              </ul>
+            )}
+            {pastHolidays.length>0&&(
+              <>
+                <h3 className="font-bold text-slate-900 mt-6 mb-2 text-sm">Earlier this FY</h3>
+                <ul className="divide-y divide-slate-100">
+                  {pastHolidays.map(h=>(
+                    <li key={h.date} className="flex items-center justify-between py-3">
+                      <div><p className="font-semibold text-sm text-slate-700">{shortDate(parseKey(h.date))}</p><p className="text-xs text-slate-500 mt-0.5">{h.label}</p></div>
+                      <button onClick={()=>removeCompanyHoliday(h.date)} className="p-2 rounded-lg hover:bg-rose-50 text-rose-400"><Trash2 className="w-4 h-4"/></button>
+                    </li>
+                  ))}
+                </ul>
+              </>
+            )}
+          </section>
+        </div>
+      )}
+
+      {/* ── ALARMS ── */}
+      {sTab==="alarms"&&(
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+          <section className="rounded-3xl bg-white border border-slate-200 p-5">
+            <h2 className="font-bold text-slate-900">Your Alarms</h2>
+            <p className="text-xs text-slate-500 mt-0.5 mb-4">Alarms are measured from your check-in time against the 8h 30m target.</p>
+            {alarms.length===0?<p className="text-sm text-slate-500 py-6 text-center">No alarms yet. Add one from the presets.</p>:(
+              <ul className="divide-y divide-slate-100">
+                {alarms.map(a=>(
+                  <li key={a.id} className="flex items-center justify-between py-3 gap-3">
+                    <div className="min-w-0">
+                      <p className={`font-semibold text-sm ${a.enabled?"text-slate-900":"text-slate-400"}`}>{a.label||offsetLabel(a.offsetMin)}</p>
+                      <p className="text-xs text-slate-500 mt-0.5">{offsetLabel(a.offsetMin)}{a.repeatMin?` · repeats every ${a.repeatMin} min`:""}</p>
+                    </div>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <button onClick={()=>updateAlarm(a.id,{enabled:!a.enabled})} className={`p-2 rounded-lg ${a.enabled?"text-emerald-600 hover:bg-emerald-50":"text-slate-300 hover:bg-slate-50"}`}>{a.enabled?<Bell className="w-4 h-4"/>:<BellOff className="w-4 h-4"/>}</button>
+                      <button onClick={()=>removeAlarm(a.id)} className="p-2 rounded-lg hover:bg-rose-50 text-rose-500"><Trash2 className="w-4 h-4"/></button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+
+            <h3 className="font-bold text-slate-900 mt-6 mb-2 text-sm">Quick add</h3>
+            <div className="flex flex-wrap gap-2">
+              {ALARM_PRESETS.map(p=>(
+                <button key={p.label} onClick={()=>addAlarm(p)} className="px-3 py-2 rounded-xl border border-slate-200 text-xs font-semibold text-slate-700 hover:bg-slate-50 flex items-center gap-1.5"><Plus className="w-3.5 h-3.5"/>{p.label}</button>
+              ))}
+            </div>
+
+            <h3 className="font-bold text-slate-900 mt-6 mb-2 text-sm">Custom</h3>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block text-[11px] font-semibold text-slate-600 mb-1.5">Minutes from target</label>
+                <input type="number" value={customOffset} onChange={e=>setCustomOffset(Number(e.target.value))} step={5} className="w-full px-3 py-2.5 rounded-xl border border-slate-200 font-mono text-sm focus:outline-none focus:border-emerald-500"/>
+                <p className="text-[10px] text-slate-400 mt-1">Negative = before, positive = after</p>
+              </div>
+              <div>
+                <label className="block text-[11px] font-semibold text-slate-600 mb-1.5">Repeat every (min)</label>
+                <input type="number" value={customRepeat} onChange={e=>setCustomRepeat(Math.max(0,Number(e.target.value)))} min={0} step={5} className="w-full px-3 py-2.5 rounded-xl border border-slate-200 font-mono text-sm focus:outline-none focus:border-emerald-500"/>
+                <p className="text-[10px] text-slate-400 mt-1">0 = fire once</p>
+              </div>
+            </div>
+            <button onClick={()=>addAlarm({label:offsetLabel(customOffset),offsetMin:customOffset,repeatMin:customRepeat})} className="w-full mt-3 px-4 py-2.5 rounded-xl bg-slate-900 text-white font-semibold text-sm flex items-center justify-center gap-2"><Plus className="w-4 h-4"/> Add custom alarm</button>
+          </section>
+
+          <section className="rounded-3xl bg-white border border-slate-200 p-5">
+            <h2 className="font-bold text-slate-900">Sound & Alerts</h2>
+            <p className="text-xs text-slate-500 mt-0.5 mb-4">Tones are generated in-browser — no download needed.</p>
+
+            <label className="block text-xs font-semibold text-slate-700 mb-2">Alarm tone</label>
+            <div className="grid grid-cols-2 gap-2">
+              {Object.entries(ALARM_SOUNDS).map(([key,v])=>(
+                <button key={key} onClick={()=>{updateSettings({alarmSound:key});playAlarmSound(key,settings.alarmVolume);}} className={`px-3 py-2.5 rounded-xl border text-xs font-semibold flex items-center justify-between ${settings.alarmSound===key?"border-emerald-500 bg-emerald-50 text-emerald-700":"border-slate-200 text-slate-700 hover:bg-slate-50"}`}>
+                  {v.label}{settings.alarmSound===key&&<CheckCircle2 className="w-3.5 h-3.5"/>}
+                </button>
+              ))}
+            </div>
+
+            <label className="block text-xs font-semibold text-slate-700 mb-2 mt-5">Volume · {Math.round((settings.alarmVolume??0.6)*100)}%</label>
+            <input type="range" min={0.05} max={1} step={0.05} value={settings.alarmVolume??0.6} onChange={e=>updateSettings({alarmVolume:Number(e.target.value)})} className="w-full accent-emerald-500"/>
+
+            <button onClick={()=>{unlockAudio();playAlarmSound(settings.alarmSound,settings.alarmVolume);buzz(settings.vibrate);}} className="w-full mt-4 px-4 py-3 rounded-xl border border-slate-200 font-semibold text-sm text-slate-700 hover:bg-slate-50 flex items-center justify-center gap-2"><Play className="w-4 h-4"/> Test alarm</button>
+
+            <div className="mt-5 space-y-3">
+              <div className="flex items-center justify-between rounded-2xl border border-slate-200 p-4">
+                <div className="min-w-0 pr-3"><p className="text-sm font-semibold text-slate-900">Vibrate</p><p className="text-xs text-slate-500 mt-0.5">On supported phones.</p></div>
+                <button onClick={()=>updateSettings({vibrate:!settings.vibrate})} className={`shrink-0 w-12 h-7 rounded-full transition relative ${settings.vibrate?"bg-emerald-500":"bg-slate-300"}`}><span className={`absolute top-1 w-5 h-5 rounded-full bg-white transition-all ${settings.vibrate?"left-6":"left-1"}`}/></button>
+              </div>
+              <div className="flex items-center justify-between rounded-2xl border border-slate-200 p-4">
+                <div className="min-w-0 pr-3"><p className="text-sm font-semibold text-slate-900">Browser notification</p><p className="text-xs text-slate-500 mt-0.5">{notifState==="granted"?"Permission granted.":notifState==="denied"?"Blocked — enable it in site settings.":"Permission needed."}</p></div>
+                {notifState==="granted"
+                  ? <button onClick={()=>updateSettings({notify:!settings.notify})} className={`shrink-0 w-12 h-7 rounded-full transition relative ${settings.notify?"bg-emerald-500":"bg-slate-300"}`}><span className={`absolute top-1 w-5 h-5 rounded-full bg-white transition-all ${settings.notify?"left-6":"left-1"}`}/></button>
+                  : <button onClick={askNotify} className="shrink-0 px-3 py-2 rounded-lg bg-slate-900 text-white text-xs font-semibold">Enable</button>}
+              </div>
+            </div>
+
+            <div className="mt-5 rounded-2xl border border-amber-200 bg-amber-50 p-4 flex gap-3">
+              <AlertCircle className="w-4 h-4 text-amber-600 mt-0.5 shrink-0"/>
+              <p className="text-xs text-amber-800">Alarms only ring while the app is open in a tab. If the tab was in the background, the beep fires as soon as it wakes up — up to 5 minutes late, after which it's skipped silently.</p>
+            </div>
+          </section>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ============================================================
    ANALYTICS VIEW — Weekly / Monthly / FY tabs
    ============================================================ */
-function AnalyticsView({logs,fySurplus}) {
+function AnalyticsView({logs,fySurplus,settings}) {
   const today=new Date();
   const [aTab,setATab]=useState("weekly");
   const [cursor,setCursor]=useState({year:today.getFullYear(),month:today.getMonth()});
@@ -650,26 +1307,26 @@ function AnalyticsView({logs,fySurplus}) {
 
   const navigate=(delta)=>{ const nm=cursor.month+delta; if(nm<0) setCursor({year:cursor.year-1,month:11}); else if(nm>11) setCursor({year:cursor.year+1,month:0}); else setCursor({year:cursor.year,month:nm}); };
 
-  const weeks=useMemo(()=>getWeeksInMonth(cursor.year,cursor.month,logs),[logs,cursor]);
+  const weeks=useMemo(()=>getWeeksInMonth(cursor.year,cursor.month,logs,settings),[logs,cursor,settings]);
   const weekCumulative=useMemo(()=>{ let s=0; return weeks.map(w=>{s+=w.surplus;return s;}); },[weeks]);
 
   const fyMonths=useMemo(()=>{
     const arr=[];
-    for(let m=3;m<=14;m++) { const month=m%12,year=m<12?fyCursor:fyCursor+1; arr.push({year,month,...getMonthlyStats(logs,year,month)}); }
+    for(let m=3;m<=14;m++) { const month=m%12,year=m<12?fyCursor:fyCursor+1; arr.push({year,month,...getMonthlyStats(logs,year,month,settings)}); }
     return arr;
-  },[logs,fyCursor]);
+  },[logs,fyCursor,settings]);
   const fyCumulative=useMemo(()=>{ let s=0; return fyMonths.map(m=>{s+=m.surplus;return s;}); },[fyMonths]);
 
   const fyTotals=useMemo(()=>{
     const start=new Date(fyCursor,3,1),end=new Date(fyCursor+1,2,31);
     let totalWorked=0,workedDays=0,totalLeaves=0,totalDays=0;
-    Object.values(logs).forEach(l=>{ const d=parseKey(l.date); if(d<start||d>end) return; if(l.status==="working"){totalWorked+=l.totalMinutes||0;workedDays++;}if(l.status==="leave")totalLeaves++; });
-    for(let m=3;m<=14;m++){const month=m%12,year=m<12?fyCursor:fyCursor+1;totalDays+=workingDaysInMonth(year,month);}
+    Object.values(logs).forEach(l=>{ const d=parseKey(l.date); if(d<start||d>end) return; if(l.status==="working"){totalWorked+=l.totalMinutes||0;workedDays++;}if(l.status==="leave"&&!isOff(d,settings))totalLeaves++; });
+    for(let m=3;m<=14;m++){const month=m%12,year=m<12?fyCursor:fyCursor+1;totalDays+=workingDaysInMonth(year,month,settings);}
     return {totalWorked,workedDays,totalLeaves,totalDays,surplus:totalWorked-workedDays*TARGET_MINUTES};
-  },[logs,fyCursor]);
+  },[logs,fyCursor,settings]);
 
   const tabStyle=(id)=>`px-4 py-2 rounded-xl text-sm font-semibold transition ${aTab===id?"bg-slate-900 text-white":"text-slate-600 hover:bg-slate-100"}`;
-  const curMonthStats=useMemo(()=>getMonthlyStats(logs,cursor.year,cursor.month),[logs,cursor]);
+  const curMonthStats=useMemo(()=>getMonthlyStats(logs,cursor.year,cursor.month,settings),[logs,cursor,settings]);
 
   return (
     <div className="space-y-5">
