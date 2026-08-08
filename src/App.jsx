@@ -10,7 +10,8 @@ import {
   Palmtree, History as HistoryIcon, TrendingUp, CheckCircle2,
   Trash2, Sparkles, LogOut, Mail, Lock, User, Loader2,
   Settings as SettingsIcon, Bell, BellOff, PartyPopper,
-  Briefcase, Play,
+  Briefcase, Play, FileEdit, ShieldCheck, Check, XCircle,
+  Users, ClipboardList, ScrollText, Pencil,
 } from "lucide-react";
 
 import { initializeApp } from "firebase/app";
@@ -21,7 +22,8 @@ import {
 } from "firebase/auth";
 import {
   getFirestore, doc, setDoc, onSnapshot, serverTimestamp, getDoc,
-  collection, query, where, getDocs,
+  collection, query, where, getDocs, addDoc, updateDoc,
+  orderBy, writeBatch,
 } from "firebase/firestore";
 
 // 🔑 PASTE YOUR FIREBASE CONFIG HERE
@@ -43,6 +45,27 @@ const TARGET_MINUTES = 510;
 const ANNUAL_LEAVES = 20;
 const LOCAL_KEY = "work_tracker_v1";
 
+/* Admin authorization — the ONLY email with admin powers.
+   This is checked against the Firebase Auth token email (verified by Firebase),
+   never against a Firestore field a user could edit. Must be mirrored in
+   firestore.rules for real enforcement. */
+const ADMIN_EMAIL = "k10noob18@gmail.com";
+const isAdminEmail = (email) => (email||"").trim().toLowerCase() === ADMIN_EMAIL;
+
+/* Self-service backfill: a user may fill an EMPTY past record within this many
+   days with no approval. Older than this → must go through a correction request. */
+const BACKFILL_WINDOW_DAYS = 30;
+
+const CORRECTION_TYPES = {
+  check_in:         "Check-in time",
+  check_out:        "Check-out time",
+  status:           "Attendance status",
+  leave_add:        "Add forgotten leave",
+  attendance_add:   "Add forgotten attendance",
+  working_day_flag: "Working-day status",
+  other:            "Other",
+};
+
 /* Settings shape stored at users/{uid}.settings */
 const DEFAULT_SETTINGS = {
   firstSatOverrides: {},   // { "2026-07": "working" }  → that month's 1st Sat is a working day
@@ -60,6 +83,16 @@ const pad = (n) => String(n).padStart(2, "0");
 const dateKey = (d) => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
 const parseKey = (k) => { const [y,m,d]=k.split("-").map(Number); return new Date(y,m-1,d); };
 const todayKey = () => dateKey(new Date());
+const startOfToday = () => new Date(new Date().setHours(0,0,0,0));
+const daysBetween = (a,b) => Math.round((b-a)/86400000);
+// How a past empty date can be filled: self-service, request-only, or not at all.
+const backfillEligibility = (dateStr) => {
+  const d=parseKey(dateStr), t=startOfToday();
+  if(d>t) return "future";                         // can't record the future
+  const age=daysBetween(d,t);
+  if(age<=BACKFILL_WINDOW_DAYS) return "self";      // within window → no approval
+  return "request";                                 // older → correction request only
+};
 const formatTime12 = (input) => {
   const d=typeof input==="string"?new Date(input):input;
   let h=d.getHours(); const m=d.getMinutes(); const ampm=h>=12?"PM":"AM";
@@ -268,33 +301,200 @@ const ALARM_PRESETS = [
 function useFirestoreState(userId) {
   const [state,setState]=useState({logs:{},activeTimer:null,settings:DEFAULT_SETTINGS});
   const [loading,setLoading]=useState(true);
-  const writeTimer=useRef(null), isLocal=useRef(false);
+  const [syncError,setSyncError]=useState(null);
+  const writeTimer=useRef(null);
+  const hydrated=useRef(false);       // has the SERVER (not cache) snapshot ever arrived?
+  const pendingWrites=useRef(0);      // how many of our own writes are still in flight
+  const latestState=useRef(null);     // newest local state, for flush-on-unmount
+
   useEffect(()=>{
-    if(!userId) return;
-    const unsub=onSnapshot(doc(db,"users",userId),(snap)=>{
-      if(snap.exists()) {
+    hydrated.current=false; pendingWrites.current=0;
+    if(!userId){ setLoading(false); return; }
+    const unsub=onSnapshot(doc(db,"users",userId),{includeMetadataChanges:true},(snap)=>{
+      // Only trust a snapshot as "loaded" once it's confirmed from the server.
+      if(!snap.metadata.fromCache) hydrated.current=true;
+
+      // Ignore snapshots while our own writes are still settling — they may echo
+      // pre-write state and clobber the optimistic UI.
+      if(pendingWrites.current>0){
+        if(!snap.metadata.hasPendingWrites) pendingWrites.current=Math.max(0,pendingWrites.current-1);
+        if(!snap.metadata.fromCache) setLoading(false);
+        return;
+      }
+
+      if(snap.exists()){
         const data=snap.data();
-        if(!isLocal.current) setState({
+        setState({
           logs:data.logs||{},
           activeTimer:data.activeTimer||null,
           settings:{...DEFAULT_SETTINGS,...(data.settings||{})},
         });
-        isLocal.current=false;
       }
-      setLoading(false);
-    },()=>setLoading(false));
+      // Don't unlock the UI on a cache-only first paint; wait for the server.
+      if(!snap.metadata.fromCache) setLoading(false);
+    },(err)=>{ console.error(err); setSyncError("Couldn't reach the server. Your data may not be up to date."); setLoading(false); });
     return unsub;
   },[userId]);
+
+  const flush=async(next)=>{
+    if(!userId) return;
+    if(!hydrated.current){ console.warn("Blocked a write before server data loaded — protecting existing data."); return; }
+    pendingWrites.current+=1;
+    try {
+      await setDoc(doc(db,"users",userId),{logs:next.logs,activeTimer:next.activeTimer,settings:next.settings||DEFAULT_SETTINGS,updatedAt:serverTimestamp()},{merge:true});
+      setSyncError(null);
+    } catch(e){
+      console.error(e);
+      pendingWrites.current=Math.max(0,pendingWrites.current-1);
+      setSyncError("Your last change didn't save. Check your connection.");
+    }
+  };
+
   const updateState=(updater)=>{
     setState(prev=>{
       const next=typeof updater==="function"?updater(prev):updater;
-      isLocal.current=true;
+      latestState.current=next;
       if(writeTimer.current) clearTimeout(writeTimer.current);
-      writeTimer.current=setTimeout(async()=>{ if(!userId) return; try { await setDoc(doc(db,"users",userId),{logs:next.logs,activeTimer:next.activeTimer,settings:next.settings||DEFAULT_SETTINGS,updatedAt:serverTimestamp()},{merge:true}); } catch(e){console.error(e);} },500);
+      writeTimer.current=setTimeout(()=>flush(next),500);
       return next;
     });
   };
-  return [state,updateState,loading];
+
+  // Flush any pending debounced write if the tab is backgrounded or closing.
+  useEffect(()=>{
+    const handler=()=>{ if(writeTimer.current&&latestState.current){ clearTimeout(writeTimer.current); writeTimer.current=null; flush(latestState.current); } };
+    const visHandler=()=>{ if(document.visibilityState==="hidden") handler(); };
+    document.addEventListener("visibilitychange",visHandler);
+    window.addEventListener("beforeunload",handler);
+    return ()=>{ document.removeEventListener("visibilitychange",visHandler); window.removeEventListener("beforeunload",handler); };
+  },[userId]);
+
+  return [state,updateState,loading,syncError];
+}
+
+/* ============================================================
+   CORRECTION REQUESTS + AUDIT LOG — data layer
+   Top-level collections so the admin can query across users.
+   All writes that change a record are atomic batches:
+   record + request-status + audit entry commit together or not at all.
+   ============================================================ */
+
+// A normal user subscribes to their OWN requests. The admin subscribes to ALL.
+function useCorrectionRequests(user, isAdmin) {
+  const [requests,setRequests]=useState([]);
+  const [loaded,setLoaded]=useState(false);
+  useEffect(()=>{
+    if(!user){ setRequests([]); setLoaded(true); return; }
+    let q;
+    try {
+      q = isAdmin
+        ? query(collection(db,"correctionRequests"),orderBy("createdAt","desc"))
+        : query(collection(db,"correctionRequests"),where("userId","==",user.uid));
+    } catch { setLoaded(true); return; }
+    const unsub=onSnapshot(q,(snap)=>{
+      const rows=snap.docs.map(d=>({id:d.id,...d.data()}));
+      // non-admin path can't orderBy without a composite index, so sort client-side
+      rows.sort((a,b)=>{
+        const ta=a.createdAt?.toMillis?.()??0, tb=b.createdAt?.toMillis?.()??0;
+        return tb-ta;
+      });
+      setRequests(rows); setLoaded(true);
+    },(e)=>{ console.error(e); setLoaded(true); });
+    return unsub;
+  },[user?.uid,isAdmin]);
+  return [requests,loaded];
+}
+
+function useAuditLog(user, isAdmin, filterUserId) {
+  const [entries,setEntries]=useState([]);
+  useEffect(()=>{
+    if(!user){ setEntries([]); return; }
+    let q;
+    try {
+      if(isAdmin){
+        q = filterUserId
+          ? query(collection(db,"auditLog"),where("userId","==",filterUserId))
+          : query(collection(db,"auditLog"));
+      } else {
+        q = query(collection(db,"auditLog"),where("userId","==",user.uid));
+      }
+    } catch { return; }
+    const unsub=onSnapshot(q,(snap)=>{
+      const rows=snap.docs.map(d=>({id:d.id,...d.data()}));
+      rows.sort((a,b)=>{ const ta=a.timestamp?.toMillis?.()??0, tb=b.timestamp?.toMillis?.()??0; return tb-ta; });
+      setEntries(rows);
+    },(e)=>console.error(e));
+    return unsub;
+  },[user?.uid,isAdmin,filterUserId]);
+  return entries;
+}
+
+// Submit a correction request (user-side, no record change yet — just a request doc).
+async function submitCorrectionRequest(user,{targetDate,correctionType,currentValue,requestedValue,reason}) {
+  return addDoc(collection(db,"correctionRequests"),{
+    userId:user.uid, userEmail:user.email||"",
+    userName:user.displayName||user.email||"",
+    targetDate, correctionType,
+    currentValue:currentValue??null, requestedValue:requestedValue??null,
+    reason:reason||"", status:"pending",
+    createdAt:serverTimestamp(), decidedAt:null, decidedBy:null, adminComment:"",
+  });
+}
+
+async function cancelCorrectionRequest(requestId) {
+  return updateDoc(doc(db,"correctionRequests",requestId),{status:"cancelled",decidedAt:serverTimestamp()});
+}
+
+// Write a self-service backfill straight to the user's own doc + an audit entry.
+// Not a batch across collections is fine here (no request doc involved), but we
+// still log the audit entry so admin has passive visibility.
+async function logAudit(entry) {
+  return addDoc(collection(db,"auditLog"),{ timestamp:serverTimestamp(), ...entry });
+}
+
+/* Admin decision on a request — atomic:
+   1. flip request status  2. (if approved) apply change to user doc  3. audit entry
+   All in one writeBatch so we can't half-apply. */
+async function decideCorrectionRequest({request,approve,adminUser,adminComment,applyToLogs}) {
+  const batch=writeBatch(db);
+  const reqRef=doc(db,"correctionRequests",request.id);
+  batch.update(reqRef,{
+    status:approve?"approved":"rejected",
+    decidedAt:serverTimestamp(), decidedBy:adminUser.email||"", adminComment:adminComment||"",
+  });
+  if(approve && applyToLogs){
+    const userRef=doc(db,"users",request.userId);
+    batch.set(userRef,{logs:applyToLogs.nextLogs,updatedAt:serverTimestamp()},{merge:true});
+  }
+  const auditRef=doc(collection(db,"auditLog"));
+  batch.set(auditRef,{
+    userId:request.userId, targetDate:request.targetDate,
+    field:request.correctionType,
+    originalValue:request.currentValue??null,
+    newValue:approve?(request.requestedValue??null):null,
+    reason:request.reason||"", source:"user_request",
+    requestId:request.id, actingAdmin:adminUser.email||"",
+    status:approve?"approved":"rejected",
+    timestamp:serverTimestamp(),
+  });
+  return batch.commit();
+}
+
+/* Admin direct edit — atomic: apply to user doc + audit entry, and supersede any
+   pending request on the same date so nothing dangles. */
+async function adminDirectEdit({targetUserId,nextLogs,field,originalValue,newValue,targetDate,adminUser,pendingToSupersede=[]}) {
+  const batch=writeBatch(db);
+  batch.set(doc(db,"users",targetUserId),{logs:nextLogs,updatedAt:serverTimestamp()},{merge:true});
+  pendingToSupersede.forEach(rid=>batch.update(doc(db,"correctionRequests",rid),{status:"superseded",decidedAt:serverTimestamp(),decidedBy:adminUser.email||""}));
+  const auditRef=doc(collection(db,"auditLog"));
+  batch.set(auditRef,{
+    userId:targetUserId, targetDate, field,
+    originalValue:originalValue??null, newValue:newValue??null,
+    reason:"Admin direct edit", source:"admin_direct_edit",
+    requestId:null, actingAdmin:adminUser.email||"",
+    status:"applied", timestamp:serverTimestamp(),
+  });
+  return batch.commit();
 }
 
 /* ---- UI Primitives ---- */
@@ -315,7 +515,7 @@ function Tile({label,value,sub,tone="slate",icon:Icon}) {
   return (<div className={`rounded-2xl border p-4 ${tones[tone]}`}><div className="flex items-start justify-between"><div className="text-xs font-medium text-slate-600">{label}</div>{Icon&&<Icon className="w-4 h-4 text-slate-400"/>}</div><div className="mt-2 text-2xl font-bold text-slate-900 tracking-tight font-mono">{value}</div>{sub&&<div className="text-xs text-slate-500 mt-1">{sub}</div>}</div>);
 }
 function Pill({children,tone="emerald"}) {
-  const tones={emerald:"bg-emerald-100 text-emerald-700 border-emerald-200",amber:"bg-amber-100 text-amber-700 border-amber-200",rose:"bg-rose-100 text-rose-700 border-rose-200",slate:"bg-slate-100 text-slate-700 border-slate-200",sky:"bg-sky-100 text-sky-700 border-sky-200"};
+  const tones={emerald:"bg-emerald-100 text-emerald-700 border-emerald-200",amber:"bg-amber-100 text-amber-700 border-amber-200",rose:"bg-rose-100 text-rose-700 border-rose-200",slate:"bg-slate-100 text-slate-700 border-slate-200",sky:"bg-sky-100 text-sky-700 border-sky-200",violet:"bg-violet-100 text-violet-700 border-violet-200"};
   return <span className={`inline-flex items-center text-[10px] font-bold uppercase tracking-wider px-2 py-1 rounded-full border ${tones[tone]}`}>{children}</span>;
 }
 function Modal({open,onClose,title,children}) {
@@ -383,8 +583,22 @@ export default function App() {
     setUser(u);
 
     if (u) {
-      const snap = await getDoc(doc(db, "users", u.uid));
-      setUserProfile(snap.exists() ? snap.data() : null);
+      const ref = doc(db, "users", u.uid);
+      const snap = await getDoc(ref);
+      const data = snap.exists() ? snap.data() : null;
+      setUserProfile(data);
+      console.log("[profile-sync] uid:", u.uid, "auth email:", u.email, "firestore data:", data);
+      const wantName = u.displayName || "";
+      const wantEmail = u.email || "";
+      if (!data || data.email !== wantEmail || data.name !== wantName) {
+        console.log("[profile-sync] writing", { email: wantEmail, name: wantName });
+        try {
+          await setDoc(ref, { email: wantEmail, name: wantName }, { merge: true });
+          console.log("[profile-sync] write succeeded");
+        } catch (e) { console.error("[profile-sync] write FAILED:", e.code, e.message); }
+      } else {
+        console.log("[profile-sync] already in sync, skipping write");
+      }
     } else {
       setUserProfile(null);
     }
@@ -403,7 +617,11 @@ export default function App() {
    MAIN TRACKER
    ============================================================ */
 function WorkHoursTracker({ user, userProfile }) {
-  const [state,setState,loadingData]=useFirestoreState(user.uid);
+  const [state,setState,loadingData,syncError]=useFirestoreState(user.uid);
+  const isAdmin=isAdminEmail(user.email);
+  const [requests,requestsLoaded]=useCorrectionRequests(user,isAdmin);
+  const myRequests=useMemo(()=>isAdmin?requests.filter(r=>r.userId===user.uid):requests,[requests,isAdmin,user.uid]);
+  const pendingAdminCount=useMemo(()=>isAdmin?requests.filter(r=>r.status==="pending").length:0,[requests,isAdmin]);
   const [tab,setTab]=useState("dashboard");
   const [now,setNow]=useState(Date.now());
   const [confirmReset,setConfirmReset]=useState(false);
@@ -411,6 +629,7 @@ function WorkHoursTracker({ user, userProfile }) {
   const [showProfile,setShowProfile]=useState(false);
   const [showMigrate,setShowMigrate]=useState(false);
   const [ringingAlarm,setRingingAlarm]=useState(null);
+  const [correctionTarget,setCorrectionTarget]=useState(null);
 
   const settings=state.settings||DEFAULT_SETTINGS;
 
@@ -452,8 +671,29 @@ function WorkHoursTracker({ user, userProfile }) {
   const checkOut=()=>performCheckout(new Date());
   const resetDay=()=>{ setState(s=>{ const nl={...s.logs}; delete nl[tKey]; return {...s,logs:nl,activeTimer:null}; }); setConfirmReset(false); };
   const finalizeStaleAt=(mode)=>{ if(!activeTimer) return; if(mode==="discard"){setState(s=>({...s,activeTimer:null}));return;} const ci=new Date(activeTimer.checkInISO); performCheckout(new Date(ci.getTime()+TARGET_MINUTES*60000),activeTimer.date); };
-  const addLeave=(dateStr)=>{ if(!dateStr) return; const d=parseKey(dateStr); const kind=dayKind(d,state.settings||DEFAULT_SETTINGS); if(kind!=="working"){alert(kind==="holiday"?"That day is already a company holiday — no leave needed.":"That day is already off.");return;} if(state.logs[dateStr]?.status==="working"){alert("That day already has a working log.");return;} if(d<new Date(new Date().setHours(0,0,0,0))){alert("Backfilling past dates is not allowed.");return;} if(leavesRemaining<=0){alert("No leave balance remaining.");return;} setState(s=>({...s,logs:{...s.logs,[dateStr]:{date:dateStr,status:"leave"}}})); };
+  const addLeave=(dateStr)=>{ if(!dateStr) return; const d=parseKey(dateStr); const kind=dayKind(d,state.settings||DEFAULT_SETTINGS); if(kind!=="working"){alert(kind==="holiday"?"That day is already a company holiday — no leave needed.":"That day is already off.");return;} if(state.logs[dateStr]?.status==="working"){alert("That day already has attendance. Submit a correction request if it's wrong.");return;} if(state.logs[dateStr]?.status==="leave"){alert("Leave is already recorded for that day.");return;} const elig=backfillEligibility(dateStr); if(elig==="future"){alert("You can't record leave for a future date.");return;} if(elig==="request"){alert(`That date is more than ${BACKFILL_WINDOW_DAYS} days old. Please submit a correction request instead.`);return;} if(leavesRemaining<=0){alert("No leave balance remaining.");return;} setState(s=>({...s,logs:{...s.logs,[dateStr]:{date:dateStr,status:"leave"}}})); if(dateStr!==tKey) logAudit({userId:user.uid,targetDate:dateStr,field:"leave_add",originalValue:null,newValue:"leave",reason:"Self-service backfill",source:"user_backfill",requestId:null,actingAdmin:null,status:"applied"}).catch(()=>{}); };
   const removeLeave=(dateStr)=>setState(s=>{ const nl={...s.logs}; delete nl[dateStr]; return {...s,logs:nl}; });
+
+  // NEW: backfill attendance for an empty PAST working day (fixes off→working bug + Requirement 1).
+  // Records a completed working log directly from entered check-in/out times.
+  const addPastAttendance=(dateStr,checkInHM,checkOutHM)=>{
+    if(!dateStr) return {ok:false,msg:"No date."};
+    const d=parseKey(dateStr);
+    if(dayKind(d,settings)!=="working") return {ok:false,msg:"That day isn't a working day. Mark it working first (Calendar), then add attendance."};
+    if(state.logs[dateStr]) return {ok:false,msg:"That day already has a record. Use a correction request to change it."};
+    const elig=backfillEligibility(dateStr);
+    if(elig==="future") return {ok:false,msg:"You can't record attendance for a future date."};
+    if(elig==="request") return {ok:false,msg:`That date is more than ${BACKFILL_WINDOW_DAYS} days old. Submit a correction request instead.`};
+    const [ih,im]=checkInHM.split(":").map(Number), [oh,om]=checkOutHM.split(":").map(Number);
+    if([ih,im,oh,om].some(isNaN)) return {ok:false,msg:"Enter valid check-in and check-out times."};
+    const ci=new Date(d); ci.setHours(ih,im,0,0);
+    const co=new Date(d); co.setHours(oh,om,0,0);
+    if(co<=ci) return {ok:false,msg:"Check-out must be after check-in."};
+    const totalMinutes=Math.round((co-ci)/60000);
+    setState(s=>({...s,logs:{...s.logs,[dateStr]:{date:dateStr,status:"working",checkIn:ci.toISOString(),checkOut:co.toISOString(),totalMinutes}}}));
+    logAudit({userId:user.uid,targetDate:dateStr,field:"attendance_add",originalValue:null,newValue:`${checkInHM}–${checkOutHM}`,reason:"Self-service backfill",source:"user_backfill",requestId:null,actingAdmin:null,status:"applied"}).catch(()=>{});
+    return {ok:true};
+  };
   const exportCSV=()=>{ const rows=[["Date","Day","Status","Check-in","Check-out","Total Hours","vs Target (min)"]]; Object.values(state.logs).sort((a,b)=>a.date.localeCompare(b.date)).forEach(l=>{ const d=parseKey(l.date); const days=["Sun","Mon","Tue","Wed","Thu","Fri","Sat"]; rows.push([l.date,days[d.getDay()],l.status,l.checkIn?formatTime12(l.checkIn):"",l.checkOut?formatTime12(l.checkOut):"",l.totalMinutes!=null?formatHMNoSign(l.totalMinutes):"",l.status==="working"?(l.totalMinutes-TARGET_MINUTES):""]); }); const csv=rows.map(r=>r.map(c=>`"${String(c).replace(/"/g,'""')}"`).join(",")).join("\n"); const a=document.createElement("a"); a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv"})); a.download=`work-tracker-${tKey}.csv`; a.click(); };
 
   /* ---- Settings mutations ---- */
@@ -617,13 +857,21 @@ function WorkHoursTracker({ user, userProfile }) {
             {id:"calendar",label:"Calendar",icon:CalendarIcon},
             {id:"leaves",label:"Leaves",icon:Palmtree},
             {id:"history",label:"History",icon:HistoryIcon},
+            {id:"requests",label:"Requests",icon:FileEdit},
             {id:"analytics",label:"Analytics",icon:BarChart3},
             {id:"settings",label:"Settings",icon:SettingsIcon},
-            ...(userProfile?.role==="admin" ? [{id:"admin",label:"Admin",icon:User}] : [])
-          ].map(({id,label,icon:Icon})=>(
-            <button key={id} onClick={()=>setTab(id)} className={`flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold whitespace-nowrap transition ${tab===id?"bg-slate-900 text-white shadow-sm":"text-slate-600 hover:bg-slate-100"}`}><Icon className="w-4 h-4"/>{label}</button>
+            ...(isAdmin ? [{id:"admin",label:"Admin",icon:ShieldCheck,badge:pendingAdminCount}] : [])
+          ].map(({id,label,icon:Icon,badge})=>(
+            <button key={id} onClick={()=>setTab(id)} className={`relative flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold whitespace-nowrap transition ${tab===id?"bg-slate-900 text-white shadow-sm":"text-slate-600 hover:bg-slate-100"}`}><Icon className="w-4 h-4"/>{label}{badge>0&&<span className="ml-0.5 min-w-[18px] h-[18px] px-1 rounded-full bg-rose-500 text-white text-[10px] font-bold grid place-items-center">{badge}</span>}</button>
           ))}
         </nav>
+
+        {syncError&&(
+          <div className="mb-5 rounded-2xl border border-rose-200 bg-rose-50 p-4 flex items-start gap-3">
+            <AlertCircle className="w-5 h-5 text-rose-600 mt-0.5 shrink-0"/>
+            <div className="flex-1"><p className="text-sm font-semibold text-rose-900">Sync problem</p><p className="text-xs text-rose-700 mt-0.5">{syncError}</p></div>
+          </div>
+        )}
 
         {isStaleTimer&&(
           <div className="mb-5 rounded-2xl border border-amber-200 bg-amber-50 p-4 flex items-start gap-3">
@@ -642,10 +890,13 @@ function WorkHoursTracker({ user, userProfile }) {
         {tab==="dashboard"&&<DashboardView today={today} todayState={todayState} todayLog={todayLog} activeTimer={activeTimer} liveTimer={liveTimer} monthStats={monthStats} leavesUsed={leavesUsed} leavesRemaining={leavesRemaining} fySurplus={fySurplus} logs={state.logs} settings={settings} nextAlarm={nextAlarm} firstSatWorking={firstSatWorking} toggleFirstSat={()=>toggleFirstSat(today.getFullYear(),today.getMonth())} checkInNow={checkInNow} setCheckInTime={setCheckInTime} setCheckoutTime={setCheckoutTime} checkOut={()=>setConfirmCheckout(true)} resetDay={()=>setConfirmReset(true)} goToLeaves={()=>setTab("leaves")} goToHistory={()=>setTab("history")} goToSettings={()=>setTab("settings")}/>}
         {tab==="calendar"&&<CalendarView logs={state.logs} todayKey={tKey} settings={settings} toggleFirstSat={toggleFirstSat} addCompanyHoliday={addCompanyHoliday} removeCompanyHoliday={removeCompanyHoliday}/>}
         {tab==="leaves"&&<LeavesView logs={state.logs} settings={settings} leavesUsed={leavesUsed} leavesRemaining={leavesRemaining} addLeave={addLeave} removeLeave={removeLeave}/>}
-        {tab==="history"&&<HistoryView logs={state.logs} exportCSV={exportCSV}/>}
+        {tab==="history"&&<HistoryView logs={state.logs} exportCSV={exportCSV} onRequestCorrection={(dateStr)=>{setCorrectionTarget(dateStr);setTab("requests");}}/>}
         {tab==="analytics"&&<AnalyticsView logs={state.logs} fySurplus={fySurplus} settings={settings}/>}
         {tab==="settings"&&<SettingsView settings={settings} updateSettings={updateSettings} toggleFirstSat={toggleFirstSat} addCompanyHoliday={addCompanyHoliday} removeCompanyHoliday={removeCompanyHoliday} addAlarm={addAlarm} updateAlarm={updateAlarm} removeAlarm={removeAlarm}/>}
-        {tab==="admin"&&<AdminView currentUserProfile={userProfile}/>}
+        {tab==="requests"&&<RequestsView user={user} logs={state.logs} settings={settings} myRequests={myRequests} correctionTarget={correctionTarget} clearCorrectionTarget={()=>setCorrectionTarget(null)} addPastAttendance={addPastAttendance} addLeave={addLeave}/>}
+        {tab==="admin"&&(isAdmin
+          ? <AdminView adminUser={user} requests={requests} settings={settings}/>
+          : <div className="rounded-3xl bg-white border border-slate-200 p-8 text-center"><ShieldCheck className="w-10 h-10 text-slate-300 mx-auto mb-3"/><p className="font-semibold text-slate-900">Admins only</p><p className="text-sm text-slate-500 mt-1">This area is restricted.</p></div>)}
 
         <footer className="mt-10 pt-6 border-t border-slate-200 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-xs text-slate-500">
           <div className="flex items-center gap-2"><Sparkles className="w-3.5 h-3.5 text-amber-500"/><span>Synced to cloud · {fyLabel(today)}</span></div>
@@ -1001,18 +1252,18 @@ function LeavesView({logs,settings,leavesUsed,leavesRemaining,addLeave,removeLea
 /* ============================================================
    HISTORY VIEW
    ============================================================ */
-function HistoryView({logs,exportCSV}) {
+function HistoryView({logs,exportCSV,onRequestCorrection}) {
   const sorted=useMemo(()=>Object.values(logs).sort((a,b)=>b.date.localeCompare(a.date)),[logs]);
   return (
     <div className="rounded-3xl bg-white border border-slate-200 p-5">
       <div className="flex items-center justify-between mb-4"><h2 className="font-bold text-slate-900">Full History</h2><button onClick={exportCSV} className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-slate-200 hover:bg-slate-50 text-xs font-semibold"><Download className="w-3.5 h-3.5"/> Export CSV</button></div>
       {sorted.length===0?<p className="text-sm text-slate-500 py-12 text-center">No entries yet.</p>:(
         <>
-          <div className="sm:hidden divide-y divide-slate-100">{sorted.map(l=><RecentRow key={l.date} log={l}/>)}</div>
+          <div className="sm:hidden divide-y divide-slate-100">{sorted.map(l=>(<div key={l.date} className="py-1"><RecentRow log={l}/><button onClick={()=>onRequestCorrection(l.date)} className="mb-2 ml-1 flex items-center gap-1.5 text-xs font-semibold text-slate-500 hover:text-slate-800"><FileEdit className="w-3.5 h-3.5"/> Request correction</button></div>))}</div>
           <div className="hidden sm:block overflow-x-auto">
             <table className="w-full text-sm">
-              <thead><tr className="text-left text-xs font-bold uppercase tracking-wider text-slate-400 border-b border-slate-200"><th className="py-3 pr-4">Date</th><th className="py-3 pr-4">Status</th><th className="py-3 pr-4">Check-in</th><th className="py-3 pr-4">Check-out</th><th className="py-3 pr-4 text-right">Total</th><th className="py-3 pr-4 text-right">Δ target</th></tr></thead>
-              <tbody className="divide-y divide-slate-100">{sorted.map(l=>{ const d=parseKey(l.date),surplus=l.status==="working"?l.totalMinutes-TARGET_MINUTES:null; return (<tr key={l.date}><td className="py-3 pr-4 font-medium text-slate-900">{shortDate(d)}</td><td className="py-3 pr-4">{l.status==="leave"?<Pill tone="amber">Leave</Pill>:<Pill tone="emerald">Working</Pill>}</td><td className="py-3 pr-4 font-mono text-slate-600">{l.checkIn?formatTime12(l.checkIn):"–"}</td><td className="py-3 pr-4 font-mono text-slate-600">{l.checkOut?formatTime12(l.checkOut):"–"}</td><td className="py-3 pr-4 text-right font-mono font-semibold">{l.totalMinutes!=null?formatHMNoSign(l.totalMinutes):"–"}</td><td className={`py-3 pr-4 text-right font-mono font-semibold ${surplus==null?"text-slate-400":surplus>=0?"text-emerald-600":"text-rose-600"}`}>{surplus==null?"–":formatHM(surplus)}</td></tr>); })}</tbody>
+              <thead><tr className="text-left text-xs font-bold uppercase tracking-wider text-slate-400 border-b border-slate-200"><th className="py-3 pr-4">Date</th><th className="py-3 pr-4">Status</th><th className="py-3 pr-4">Check-in</th><th className="py-3 pr-4">Check-out</th><th className="py-3 pr-4 text-right">Total</th><th className="py-3 pr-4 text-right">Δ target</th><th className="py-3"></th></tr></thead>
+              <tbody className="divide-y divide-slate-100">{sorted.map(l=>{ const d=parseKey(l.date),surplus=l.status==="working"?l.totalMinutes-TARGET_MINUTES:null; return (<tr key={l.date}><td className="py-3 pr-4 font-medium text-slate-900">{shortDate(d)}</td><td className="py-3 pr-4">{l.status==="leave"?<Pill tone="amber">Leave</Pill>:<Pill tone="emerald">Working</Pill>}</td><td className="py-3 pr-4 font-mono text-slate-600">{l.checkIn?formatTime12(l.checkIn):"–"}</td><td className="py-3 pr-4 font-mono text-slate-600">{l.checkOut?formatTime12(l.checkOut):"–"}</td><td className="py-3 pr-4 text-right font-mono font-semibold">{l.totalMinutes!=null?formatHMNoSign(l.totalMinutes):"–"}</td><td className={`py-3 pr-4 text-right font-mono font-semibold ${surplus==null?"text-slate-400":surplus>=0?"text-emerald-600":"text-rose-600"}`}>{surplus==null?"–":formatHM(surplus)}</td><td className="py-3 text-right"><button onClick={()=>onRequestCorrection(l.date)} className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-slate-200 hover:bg-slate-50 text-xs font-semibold text-slate-600"><FileEdit className="w-3.5 h-3.5"/> Correct</button></td></tr>); })}</tbody>
             </table>
           </div>
         </>
@@ -1022,88 +1273,408 @@ function HistoryView({logs,exportCSV}) {
 }
 
 /* ============================================================
-   ADMIN VIEW
+   REQUESTS VIEW (user) — backfill forgotten records + correction requests
    ============================================================ */
-function AdminView({ currentUserProfile }) {
-  const [users, setUsers] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
+const STATUS_TONE={pending:"amber",approved:"emerald",rejected:"rose",cancelled:"slate",superseded:"slate"};
+function RequestsView({user,logs,settings,myRequests,correctionTarget,clearCorrectionTarget,addPastAttendance,addLeave}) {
+  const [rTab,setRTab]=useState(correctionTarget?"correct":"backfill");
+  // Backfill state
+  const [bfDate,setBfDate]=useState(todayKey());
+  const [bfType,setBfType]=useState("attendance");
+  const [bfIn,setBfIn]=useState("09:30");
+  const [bfOut,setBfOut]=useState("18:00");
+  const [bfMsg,setBfMsg]=useState(null);
+  // Correction state
+  const [cDate,setCDate]=useState(correctionTarget||todayKey());
+  const [cType,setCType]=useState("check_in");
+  const [cValue,setCValue]=useState("");
+  const [cReason,setCReason]=useState("");
+  const [cMsg,setCMsg]=useState(null);
+  const [submitting,setSubmitting]=useState(false);
 
-  useEffect(() => {
-    const loadUsers = async () => {
-      try {
-        setError("");
+  useEffect(()=>{ if(correctionTarget){ setRTab("correct"); setCDate(correctionTarget); } },[correctionTarget]);
 
-        const snap = await getDocs(collection(db, "users"));
+  const existing=logs[cDate];
+  const currentValueForType=(type,dateStr)=>{
+    const l=logs[dateStr]; if(!l) return null;
+    if(type==="check_in") return l.checkIn?formatTime12(l.checkIn):null;
+    if(type==="check_out") return l.checkOut?formatTime12(l.checkOut):null;
+    if(type==="status") return l.status;
+    return null;
+  };
 
-        const list = snap.docs.map((docSnap) => ({
-          id: docSnap.id,
-          ...docSnap.data(),
-        }));
+  const doBackfill=()=>{
+    setBfMsg(null);
+    if(bfType==="attendance"){
+      const res=addPastAttendance(bfDate,bfIn,bfOut);
+      setBfMsg(res.ok?{ok:true,text:"Attendance recorded."}:{ok:false,text:res.msg});
+    } else {
+      // leave backfill uses existing addLeave (it alerts on failure); do a light pre-check for messaging
+      const elig=backfillEligibility(bfDate);
+      if(elig==="future"){setBfMsg({ok:false,text:"You can't record leave for a future date."});return;}
+      if(elig==="request"){setBfMsg({ok:false,text:`That date is more than ${BACKFILL_WINDOW_DAYS} days old — use a correction request below.`});return;}
+      addLeave(bfDate);
+      setBfMsg({ok:true,text:"If the day was eligible, your leave is now recorded. Check the Calendar to confirm."});
+    }
+  };
 
-        setUsers(list);
-      } catch (err) {
-        console.error("Failed to load users:", err);
-        setError(err.message || "Failed to load users.");
-      } finally {
-        setLoading(false);
-      }
-    };
+  const submitRequest=async()=>{
+    setCMsg(null);
+    if(!cReason.trim()){setCMsg({ok:false,text:"Please give a reason for the correction."});return;}
+    if((cType==="check_in"||cType==="check_out"||cType==="status"||cType==="leave_type")&&!existing){setCMsg({ok:false,text:"There's no record on that date to correct. Use the Backfill tab to add one, or pick 'Add forgotten…' as the type."});return;}
+    if(!cValue.trim() && cType!=="other"){setCMsg({ok:false,text:"Enter the corrected value."});return;}
+    // block a duplicate pending request on the same date+type
+    if(myRequests.some(r=>r.status==="pending"&&r.targetDate===cDate&&r.correctionType===cType)){setCMsg({ok:false,text:"You already have a pending request for this date and field."});return;}
+    setSubmitting(true);
+    try {
+      await submitCorrectionRequest(user,{targetDate:cDate,correctionType:cType,currentValue:currentValueForType(cType,cDate),requestedValue:cValue,reason:cReason});
+      setCMsg({ok:true,text:"Request submitted. You'll see it below and the admin will review it."});
+      setCValue(""); setCReason(""); clearCorrectionTarget();
+    } catch(e){ console.error(e); setCMsg({ok:false,text:"Couldn't submit — check your connection."}); }
+    setSubmitting(false);
+  };
 
-    loadUsers();
-  }, [currentUserProfile]);
-
-  if (loading) {
-    return (
-      <div className="rounded-3xl bg-white border border-slate-200 p-5">
-        <p className="text-sm text-slate-500">Loading users...</p>
-      </div>
-    );
-  }
+  const cancel=async(id)=>{ try{ await cancelCorrectionRequest(id); }catch(e){console.error(e);} };
+  const tabStyle=(id)=>`px-4 py-2 rounded-xl text-sm font-semibold transition ${rTab===id?"bg-slate-900 text-white":"text-slate-600 hover:bg-slate-100"}`;
 
   return (
-    <div className="rounded-3xl bg-white border border-slate-200 p-5">
-      <h2 className="font-bold text-slate-900">Admin Dashboard</h2>
+    <div className="space-y-5">
+      <div className="flex gap-2 bg-slate-100 p-1.5 rounded-2xl w-fit">
+        <button className={tabStyle("backfill")} onClick={()=>setRTab("backfill")}>Add Forgotten</button>
+        <button className={tabStyle("correct")} onClick={()=>setRTab("correct")}>Request Correction</button>
+      </div>
 
-      <p className="text-sm text-slate-500 mt-1">
-        Team members in your organization.
-      </p>
-
-      {error && (
-        <p className="text-sm text-rose-600 mt-3">
-          {error}
-        </p>
+      {rTab==="backfill"&&(
+        <section className="rounded-3xl bg-white border border-slate-200 p-5 max-w-xl">
+          <h2 className="font-bold text-slate-900">Add a forgotten record</h2>
+          <p className="text-xs text-slate-500 mt-0.5 mb-4">For empty days within the last {BACKFILL_WINDOW_DAYS} days — no approval needed. Older days go through a correction request.</p>
+          <div className="flex gap-2 mb-4">
+            <button onClick={()=>setBfType("attendance")} className={`flex-1 px-4 py-2.5 rounded-xl border text-sm font-semibold ${bfType==="attendance"?"border-emerald-500 bg-emerald-50 text-emerald-700":"border-slate-200 text-slate-600"}`}>Attendance</button>
+            <button onClick={()=>setBfType("leave")} className={`flex-1 px-4 py-2.5 rounded-xl border text-sm font-semibold ${bfType==="leave"?"border-amber-500 bg-amber-50 text-amber-700":"border-slate-200 text-slate-600"}`}>Leave</button>
+          </div>
+          <label className="block text-xs font-semibold text-slate-700 mb-1.5">Date</label>
+          <input type="date" max={todayKey()} value={bfDate} onChange={e=>setBfDate(e.target.value)} className="w-full px-4 py-3 rounded-xl border border-slate-200 font-mono focus:outline-none focus:border-emerald-500"/>
+          {bfType==="attendance"&&(
+            <div className="grid grid-cols-2 gap-3 mt-3">
+              <div><label className="block text-xs font-semibold text-slate-700 mb-1.5">Check-in</label><input type="time" value={bfIn} onChange={e=>setBfIn(e.target.value)} className="w-full px-4 py-3 rounded-xl border border-slate-200 font-mono focus:outline-none focus:border-emerald-500"/></div>
+              <div><label className="block text-xs font-semibold text-slate-700 mb-1.5">Check-out</label><input type="time" value={bfOut} onChange={e=>setBfOut(e.target.value)} className="w-full px-4 py-3 rounded-xl border border-slate-200 font-mono focus:outline-none focus:border-emerald-500"/></div>
+            </div>
+          )}
+          <button onClick={doBackfill} className="w-full mt-4 px-4 py-3 rounded-xl bg-slate-900 text-white font-semibold text-sm">Add record</button>
+          {bfMsg&&<div className={`mt-3 rounded-xl px-3 py-2 text-sm ${bfMsg.ok?"bg-emerald-50 text-emerald-700 border border-emerald-200":"bg-rose-50 text-rose-700 border border-rose-200"}`}>{bfMsg.text}</div>}
+        </section>
       )}
 
-      <div className="mt-5 space-y-3">
-        {users.length === 0 && !error && (
-          <p className="text-sm text-slate-500">
-            No users found for this organization.
-          </p>
+      {rTab==="correct"&&(
+        <section className="rounded-3xl bg-white border border-slate-200 p-5 max-w-xl">
+          <h2 className="font-bold text-slate-900">Request a correction</h2>
+          <p className="text-xs text-slate-500 mt-0.5 mb-4">Existing records can't be edited directly. Your request goes to the admin for review.</p>
+          <label className="block text-xs font-semibold text-slate-700 mb-1.5">Date</label>
+          <input type="date" max={todayKey()} value={cDate} onChange={e=>setCDate(e.target.value)} className="w-full px-4 py-3 rounded-xl border border-slate-200 font-mono focus:outline-none focus:border-emerald-500"/>
+          {existing?<p className="text-[11px] text-slate-500 mt-1.5">Current: {existing.status}{existing.checkIn?` · in ${formatTime12(existing.checkIn)}`:""}{existing.checkOut?` · out ${formatTime12(existing.checkOut)}`:""}</p>:<p className="text-[11px] text-amber-600 mt-1.5">No record on this date yet.</p>}
+          <label className="block text-xs font-semibold text-slate-700 mb-1.5 mt-3">What needs correcting?</label>
+          <select value={cType} onChange={e=>setCType(e.target.value)} className="w-full px-4 py-3 rounded-xl border border-slate-200 text-sm focus:outline-none focus:border-emerald-500 bg-white">
+            {Object.entries(CORRECTION_TYPES).map(([k,v])=><option key={k} value={k}>{v}</option>)}
+          </select>
+          {cType!=="other"&&(<>
+            <label className="block text-xs font-semibold text-slate-700 mb-1.5 mt-3">Corrected value</label>
+            <input type={cType==="check_in"||cType==="check_out"?"time":"text"} value={cValue} onChange={e=>setCValue(e.target.value)} placeholder={cType==="status"?"working / leave":cType==="leave_add"?"leave":"Corrected value"} className="w-full px-4 py-3 rounded-xl border border-slate-200 text-sm font-mono focus:outline-none focus:border-emerald-500"/>
+          </>)}
+          <label className="block text-xs font-semibold text-slate-700 mb-1.5 mt-3">Reason</label>
+          <textarea value={cReason} onChange={e=>setCReason(e.target.value)} rows={2} placeholder="Why does this need to change?" className="w-full px-4 py-3 rounded-xl border border-slate-200 text-sm focus:outline-none focus:border-emerald-500 resize-none"/>
+          <button onClick={submitRequest} disabled={submitting} className="w-full mt-4 px-4 py-3 rounded-xl bg-slate-900 text-white font-semibold text-sm disabled:opacity-50 flex items-center justify-center gap-2">{submitting&&<Loader2 className="w-4 h-4 animate-spin"/>}Submit request</button>
+          {cMsg&&<div className={`mt-3 rounded-xl px-3 py-2 text-sm ${cMsg.ok?"bg-emerald-50 text-emerald-700 border border-emerald-200":"bg-rose-50 text-rose-700 border border-rose-200"}`}>{cMsg.text}</div>}
+        </section>
+      )}
+
+      <section className="rounded-3xl bg-white border border-slate-200 p-5">
+        <h2 className="font-bold text-slate-900 mb-3">My requests</h2>
+        {myRequests.length===0?<p className="text-sm text-slate-500 py-6 text-center">No requests yet.</p>:(
+          <ul className="divide-y divide-slate-100">
+            {myRequests.map(r=>(
+              <li key={r.id} className="py-3 flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap"><span className="font-semibold text-sm text-slate-900">{CORRECTION_TYPES[r.correctionType]||r.correctionType}</span><Pill tone={STATUS_TONE[r.status]||"slate"}>{r.status}</Pill></div>
+                  <p className="text-xs text-slate-500 mt-0.5">{shortDate(parseKey(r.targetDate))}{r.requestedValue?` → ${r.requestedValue}`:""}</p>
+                  {r.reason&&<p className="text-xs text-slate-400 mt-0.5 italic truncate">"{r.reason}"</p>}
+                  {r.adminComment&&<p className="text-xs text-slate-600 mt-1">Admin: {r.adminComment}</p>}
+                </div>
+                {r.status==="pending"&&<button onClick={()=>cancel(r.id)} className="shrink-0 px-3 py-1.5 rounded-lg border border-slate-200 text-xs font-semibold text-slate-600 hover:bg-slate-50">Cancel</button>}
+              </li>
+            ))}
+          </ul>
         )}
-
-        {users.map((member) => (
-          <div
-            key={member.id}
-            className="flex items-center justify-between rounded-2xl border border-slate-200 p-4"
-          >
-            <div>
-              <p className="font-semibold text-slate-900">
-                {member.name || member.email || member.id}
-              </p>
-
-              <p className="text-xs text-slate-500">
-                {member.email || "No email saved"}
-              </p>
-            </div>
-
-            <span className="text-xs font-semibold px-2 py-1 rounded-full bg-slate-100 text-slate-600">
-              {member.role || "user"}
-            </span>
-          </div>
-        ))}
-      </div>
+      </section>
     </div>
+  );
+}
+
+/* ============================================================
+   ADMIN VIEW
+   ============================================================ */
+function AdminView({ adminUser, requests, settings }) {
+  const [aTab,setATab]=useState("requests");
+  const [users,setUsers]=useState([]);
+  const [loading,setLoading]=useState(true);
+  const [error,setError]=useState("");
+  const [statusFilter,setStatusFilter]=useState("pending");
+  const [reviewing,setReviewing]=useState(null);     // request being reviewed
+  const [adminComment,setAdminComment]=useState("");
+  const [busy,setBusy]=useState(false);
+  const [selectedUser,setSelectedUser]=useState(null);   // for Users detail + direct edit
+
+  const auditEntries=useAuditLog(adminUser,true,selectedUser?.id||null);
+
+  const loadUsers=async()=>{
+    try { setError(""); const snap=await getDocs(collection(db,"users")); setUsers(snap.docs.map(d=>({id:d.id,...d.data()}))); }
+    catch(err){ console.error(err); setError(err.message||"Failed to load users."); }
+    finally{ setLoading(false); }
+  };
+  useEffect(()=>{ loadUsers(); },[]);
+
+  const filtered=useMemo(()=>requests.filter(r=>statusFilter==="all"?true:r.status===statusFilter),[requests,statusFilter]);
+  const counts=useMemo(()=>{ const c={pending:0,approved:0,rejected:0,cancelled:0,superseded:0}; requests.forEach(r=>{c[r.status]=(c[r.status]||0)+1;}); return c; },[requests]);
+
+  // Build the nextLogs for an approved request by applying the requested change.
+  const buildNextLogs=(req,targetUser)=>{
+    const logs={...(targetUser.logs||{})};
+    const day={...(logs[req.targetDate]||{date:req.targetDate})};
+    switch(req.correctionType){
+      case "check_in": { const [h,m]=(req.requestedValue||"").replace(/[^0-9:]/g,"").split(":").map(Number); if(!isNaN(h)){ const d=parseKey(req.targetDate); d.setHours(h,m||0,0,0); day.checkIn=d.toISOString(); if(day.checkOut){day.totalMinutes=Math.max(0,Math.round((new Date(day.checkOut)-d)/60000));} day.status="working"; } break; }
+      case "check_out": { const [h,m]=(req.requestedValue||"").replace(/[^0-9:]/g,"").split(":").map(Number); if(!isNaN(h)){ const d=parseKey(req.targetDate); d.setHours(h,m||0,0,0); day.checkOut=d.toISOString(); if(day.checkIn){day.totalMinutes=Math.max(0,Math.round((d-new Date(day.checkIn))/60000));} day.status="working"; } break; }
+      case "status": { day.status=(req.requestedValue||"").toLowerCase().includes("leave")?"leave":"working"; if(day.status==="leave"){delete day.checkIn;delete day.checkOut;delete day.totalMinutes;} break; }
+      case "leave_add": { day.status="leave"; delete day.checkIn; delete day.checkOut; delete day.totalMinutes; break; }
+      case "attendance_add": break; // free-form; admin should use direct edit for precise times
+      default: break;
+    }
+    logs[req.targetDate]=day;
+    return logs;
+  };
+
+  const decide=async(approve)=>{
+    if(!reviewing) return;
+    setBusy(true);
+    try {
+      let applyToLogs=null;
+      if(approve){
+        const targetUser=users.find(u=>u.id===reviewing.userId);
+        if(targetUser && ["check_in","check_out","status","leave_add"].includes(reviewing.correctionType)){
+          applyToLogs={nextLogs:buildNextLogs(reviewing,targetUser)};
+        }
+      }
+      await decideCorrectionRequest({request:reviewing,approve,adminUser,adminComment,applyToLogs});
+      await loadUsers();
+      setReviewing(null); setAdminComment("");
+    } catch(e){ console.error(e); setError("Couldn't apply the decision. Nothing was changed."); }
+    setBusy(false);
+  };
+
+  const tabStyle=(id)=>`px-4 py-2 rounded-xl text-sm font-semibold transition ${aTab===id?"bg-slate-900 text-white":"text-slate-600 hover:bg-slate-100"}`;
+  const filterStyle=(id)=>`px-3 py-1.5 rounded-lg text-xs font-semibold ${statusFilter===id?"bg-slate-900 text-white":"bg-slate-100 text-slate-600"}`;
+
+  return (
+    <div className="space-y-5">
+      <div className="flex gap-2 bg-slate-100 p-1.5 rounded-2xl w-fit overflow-x-auto">
+        <button className={tabStyle("requests")} onClick={()=>setATab("requests")}><span className="flex items-center gap-1.5"><ClipboardList className="w-4 h-4"/>Requests{counts.pending>0&&<span className="min-w-[18px] h-[18px] px-1 rounded-full bg-rose-500 text-white text-[10px] font-bold grid place-items-center">{counts.pending}</span>}</span></button>
+        <button className={tabStyle("users")} onClick={()=>{setATab("users");setSelectedUser(null);}}><span className="flex items-center gap-1.5"><Users className="w-4 h-4"/>Users</span></button>
+        <button className={tabStyle("audit")} onClick={()=>{setATab("audit");setSelectedUser(null);}}><span className="flex items-center gap-1.5"><ScrollText className="w-4 h-4"/>Audit Log</span></button>
+      </div>
+
+      {error&&<div className="rounded-xl bg-rose-50 border border-rose-200 px-3 py-2 text-sm text-rose-700">{error}</div>}
+
+      {/* ── REQUESTS ── */}
+      {aTab==="requests"&&(
+        <section className="rounded-3xl bg-white border border-slate-200 p-5">
+          <div className="flex items-center gap-2 mb-4 flex-wrap">
+            {["pending","approved","rejected","all"].map(s=><button key={s} onClick={()=>setStatusFilter(s)} className={filterStyle(s)}>{s[0].toUpperCase()+s.slice(1)}{s!=="all"&&counts[s]>0?` (${counts[s]})`:""}</button>)}
+          </div>
+          {filtered.length===0?<p className="text-sm text-slate-500 py-8 text-center">No {statusFilter==="all"?"":statusFilter} requests.</p>:(
+            <ul className="divide-y divide-slate-100">
+              {filtered.map(r=>(
+                <li key={r.id} className="py-3 flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap"><span className="font-semibold text-sm text-slate-900">{r.userName||r.userEmail}</span><Pill tone={STATUS_TONE[r.status]||"slate"}>{r.status}</Pill></div>
+                    <p className="text-xs text-slate-600 mt-0.5">{CORRECTION_TYPES[r.correctionType]||r.correctionType} · {shortDate(parseKey(r.targetDate))}</p>
+                    <p className="text-xs text-slate-500 mt-0.5">{r.currentValue?`${r.currentValue} `:""}→ {r.requestedValue||"(see reason)"}</p>
+                    {r.reason&&<p className="text-xs text-slate-400 mt-0.5 italic">"{r.reason}"</p>}
+                  </div>
+                  {r.status==="pending"
+                    ? <button onClick={()=>{setReviewing(r);setAdminComment("");}} className="shrink-0 px-3 py-1.5 rounded-lg bg-slate-900 text-white text-xs font-semibold">Review</button>
+                    : r.adminComment?<p className="shrink-0 text-xs text-slate-400 max-w-[40%]">Note: {r.adminComment}</p>:null}
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      )}
+
+      {/* ── USERS ── */}
+      {aTab==="users"&&!selectedUser&&(
+        <section className="rounded-3xl bg-white border border-slate-200 p-5">
+          <h2 className="font-bold text-slate-900 mb-3">All Users</h2>
+          {loading?<p className="text-sm text-slate-500">Loading…</p>:users.length===0?<p className="text-sm text-slate-500">No users found.</p>:(
+            <ul className="divide-y divide-slate-100">
+              {users.map(u=>{ const logCount=Object.keys(u.logs||{}).length; return (
+                <li key={u.id} className="py-3 flex items-center justify-between gap-3">
+                  <div className="min-w-0"><p className="font-semibold text-sm text-slate-900 truncate">{u.name||u.email||u.id}</p><p className="text-xs text-slate-500 truncate">{u.email||"No email"} · {logCount} record{logCount!==1?"s":""}{isAdminEmail(u.email)&&<span className="ml-1 text-emerald-600 font-semibold">· admin</span>}</p></div>
+                  <button onClick={()=>setSelectedUser(u)} className="shrink-0 px-3 py-1.5 rounded-lg border border-slate-200 text-xs font-semibold text-slate-600 hover:bg-slate-50">View</button>
+                </li>
+              ); })}
+            </ul>
+          )}
+        </section>
+      )}
+
+      {aTab==="users"&&selectedUser&&(
+        <AdminUserDetail user={selectedUser} adminUser={adminUser} settings={settings} requests={requests} auditEntries={auditEntries} onBack={()=>setSelectedUser(null)} onEdited={loadUsers}/>
+      )}
+
+      {/* ── AUDIT ── */}
+      {aTab==="audit"&&(
+        <section className="rounded-3xl bg-white border border-slate-200 p-5">
+          <h2 className="font-bold text-slate-900 mb-3">Audit Log</h2>
+          <p className="text-xs text-slate-500 -mt-2 mb-4">Every applied change, append-only.</p>
+          <AuditList entries={auditEntries} users={users}/>
+        </section>
+      )}
+
+      {/* ── REVIEW MODAL ── */}
+      <Modal open={!!reviewing} onClose={()=>!busy&&setReviewing(null)} title="Review request">
+        {reviewing&&(
+          <div>
+            <div className="rounded-2xl bg-slate-50 border border-slate-200 p-4 mb-4 space-y-1.5">
+              <p className="text-sm"><span className="text-slate-500">User:</span> <span className="font-semibold">{reviewing.userName||reviewing.userEmail}</span></p>
+              <p className="text-sm"><span className="text-slate-500">Date:</span> <span className="font-semibold">{shortDate(parseKey(reviewing.targetDate))}</span></p>
+              <p className="text-sm"><span className="text-slate-500">Type:</span> <span className="font-semibold">{CORRECTION_TYPES[reviewing.correctionType]||reviewing.correctionType}</span></p>
+              <p className="text-sm"><span className="text-slate-500">Change:</span> <span className="font-mono">{reviewing.currentValue||"—"} → {reviewing.requestedValue||"(see reason)"}</span></p>
+              <p className="text-sm"><span className="text-slate-500">Reason:</span> {reviewing.reason||"—"}</p>
+            </div>
+            {!["check_in","check_out","status","leave_add"].includes(reviewing.correctionType)&&(
+              <div className="rounded-xl bg-amber-50 border border-amber-200 px-3 py-2 text-xs text-amber-800 mb-3">This type can't be auto-applied. Approving records the decision + audit entry; make the actual change via Users → direct edit.</div>
+            )}
+            <label className="block text-xs font-semibold text-slate-700 mb-1.5">Comment (optional)</label>
+            <textarea value={adminComment} onChange={e=>setAdminComment(e.target.value)} rows={2} className="w-full px-4 py-3 rounded-xl border border-slate-200 text-sm focus:outline-none focus:border-emerald-500 resize-none mb-4" placeholder="Visible to the user"/>
+            <div className="grid grid-cols-2 gap-2">
+              <button disabled={busy} onClick={()=>decide(false)} className="px-4 py-2.5 rounded-xl border border-rose-200 text-rose-700 font-semibold text-sm disabled:opacity-50 flex items-center justify-center gap-2"><XCircle className="w-4 h-4"/>Reject</button>
+              <button disabled={busy} onClick={()=>decide(true)} className="px-4 py-2.5 rounded-xl bg-emerald-500 text-white font-semibold text-sm disabled:opacity-50 flex items-center justify-center gap-2">{busy?<Loader2 className="w-4 h-4 animate-spin"/>:<Check className="w-4 h-4"/>}Approve</button>
+            </div>
+          </div>
+        )}
+      </Modal>
+    </div>
+  );
+}
+
+function AuditList({entries,users}) {
+  const nameFor=(uid)=>{ const u=users?.find(x=>x.id===uid); return u?.name||u?.email||uid?.slice(0,6); };
+  if(!entries||entries.length===0) return <p className="text-sm text-slate-500 py-8 text-center">No audit entries yet.</p>;
+  return (
+    <ul className="divide-y divide-slate-100">
+      {entries.map(e=>(
+        <li key={e.id} className="py-3">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="font-semibold text-sm text-slate-900">{CORRECTION_TYPES[e.field]||e.field}</span>
+            <Pill tone={e.source==="admin_direct_edit"?"violet":e.source==="user_backfill"?"sky":"emerald"}>{e.source==="admin_direct_edit"?"admin edit":e.source==="user_backfill"?"backfill":"request"}</Pill>
+          </div>
+          <p className="text-xs text-slate-500 mt-0.5">{users?`${nameFor(e.userId)} · `:""}{shortDate(parseKey(e.targetDate))} · {e.originalValue??"—"} → {e.newValue??"—"}</p>
+          {e.actingAdmin&&<p className="text-[11px] text-slate-400 mt-0.5">by {e.actingAdmin}</p>}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function AdminUserDetail({user,adminUser,settings,requests,auditEntries,onBack,onEdited}) {
+  const logs=user.logs||{};
+  const sorted=useMemo(()=>Object.values(logs).sort((a,b)=>b.date.localeCompare(a.date)),[logs]);
+  const [editing,setEditing]=useState(null);   // date being edited
+  const [eStatus,setEStatus]=useState("working");
+  const [eIn,setEIn]=useState("09:30");
+  const [eOut,setEOut]=useState("18:00");
+  const [busy,setBusy]=useState(false);
+  const [msg,setMsg]=useState(null);
+
+  const openEdit=(l)=>{
+    setEditing(l.date); setMsg(null);
+    setEStatus(l.status||"working");
+    setEIn(l.checkIn?`${pad(new Date(l.checkIn).getHours())}:${pad(new Date(l.checkIn).getMinutes())}`:"09:30");
+    setEOut(l.checkOut?`${pad(new Date(l.checkOut).getHours())}:${pad(new Date(l.checkOut).getMinutes())}`:"18:00");
+  };
+
+  const saveEdit=async()=>{
+    setBusy(true); setMsg(null);
+    try {
+      const orig=logs[editing];
+      const nextLogs={...logs};
+      const day={date:editing,status:eStatus};
+      if(eStatus==="working"){
+        const [ih,im]=eIn.split(":").map(Number),[oh,om]=eOut.split(":").map(Number);
+        const ci=parseKey(editing); ci.setHours(ih,im,0,0);
+        const co=parseKey(editing); co.setHours(oh,om,0,0);
+        if(co<=ci){ setMsg("Check-out must be after check-in."); setBusy(false); return; }
+        day.checkIn=ci.toISOString(); day.checkOut=co.toISOString(); day.totalMinutes=Math.round((co-ci)/60000);
+      }
+      nextLogs[editing]=day;
+      const pending=requests.filter(r=>r.userId===user.id&&r.targetDate===editing&&r.status==="pending").map(r=>r.id);
+      await adminDirectEdit({
+        targetUserId:user.id, nextLogs, field:"admin_edit",
+        originalValue:orig?`${orig.status}${orig.checkIn?" "+formatTime12(orig.checkIn):""}`:"(none)",
+        newValue:`${day.status}${day.checkIn?" "+formatTime12(day.checkIn):""}`,
+        targetDate:editing, adminUser, pendingToSupersede:pending,
+      });
+      setEditing(null); onEdited&&await onEdited();
+    } catch(e){ console.error(e); setMsg("Couldn't save — nothing was changed."); }
+    setBusy(false);
+  };
+
+  return (
+    <section className="rounded-3xl bg-white border border-slate-200 p-5">
+      <button onClick={onBack} className="flex items-center gap-1.5 text-sm font-semibold text-slate-500 hover:text-slate-800 mb-4"><ChevronLeft className="w-4 h-4"/>All users</button>
+      <h2 className="font-bold text-slate-900">{user.name||user.email}</h2>
+      <p className="text-xs text-slate-500 mt-0.5 mb-4">{user.email} · {sorted.length} records</p>
+
+      {sorted.length===0?<p className="text-sm text-slate-500 py-6 text-center">No attendance records.</p>:(
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead><tr className="text-left text-xs font-bold uppercase tracking-wider text-slate-400 border-b border-slate-200"><th className="py-2 pr-4">Date</th><th className="py-2 pr-4">Status</th><th className="py-2 pr-4">In</th><th className="py-2 pr-4">Out</th><th className="py-2 pr-4 text-right">Total</th><th className="py-2"></th></tr></thead>
+            <tbody className="divide-y divide-slate-100">
+              {sorted.map(l=>(
+                <tr key={l.date}>
+                  <td className="py-2.5 pr-4 font-medium text-slate-900">{shortDate(parseKey(l.date))}</td>
+                  <td className="py-2.5 pr-4">{l.status==="leave"?<Pill tone="amber">Leave</Pill>:<Pill tone="emerald">Working</Pill>}</td>
+                  <td className="py-2.5 pr-4 font-mono text-slate-600">{l.checkIn?formatTime12(l.checkIn):"–"}</td>
+                  <td className="py-2.5 pr-4 font-mono text-slate-600">{l.checkOut?formatTime12(l.checkOut):"–"}</td>
+                  <td className="py-2.5 pr-4 text-right font-mono">{l.totalMinutes!=null?formatHMNoSign(l.totalMinutes):"–"}</td>
+                  <td className="py-2.5 text-right"><button onClick={()=>openEdit(l)} className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-slate-200 hover:bg-slate-50 text-xs font-semibold text-slate-600"><Pencil className="w-3.5 h-3.5"/>Edit</button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <Modal open={!!editing} onClose={()=>!busy&&setEditing(null)} title={`Edit ${editing?shortDate(parseKey(editing)):""}`}>
+        <div>
+          <div className="rounded-xl bg-violet-50 border border-violet-200 px-3 py-2 text-xs text-violet-800 mb-4">Direct edits are logged to the audit trail and supersede any pending request on this date.</div>
+          <label className="block text-xs font-semibold text-slate-700 mb-1.5">Status</label>
+          <div className="flex gap-2 mb-3">
+            <button onClick={()=>setEStatus("working")} className={`flex-1 px-4 py-2.5 rounded-xl border text-sm font-semibold ${eStatus==="working"?"border-emerald-500 bg-emerald-50 text-emerald-700":"border-slate-200 text-slate-600"}`}>Working</button>
+            <button onClick={()=>setEStatus("leave")} className={`flex-1 px-4 py-2.5 rounded-xl border text-sm font-semibold ${eStatus==="leave"?"border-amber-500 bg-amber-50 text-amber-700":"border-slate-200 text-slate-600"}`}>Leave</button>
+          </div>
+          {eStatus==="working"&&(
+            <div className="grid grid-cols-2 gap-3">
+              <div><label className="block text-xs font-semibold text-slate-700 mb-1.5">Check-in</label><input type="time" value={eIn} onChange={e=>setEIn(e.target.value)} className="w-full px-4 py-3 rounded-xl border border-slate-200 font-mono focus:outline-none focus:border-emerald-500"/></div>
+              <div><label className="block text-xs font-semibold text-slate-700 mb-1.5">Check-out</label><input type="time" value={eOut} onChange={e=>setEOut(e.target.value)} className="w-full px-4 py-3 rounded-xl border border-slate-200 font-mono focus:outline-none focus:border-emerald-500"/></div>
+            </div>
+          )}
+          {msg&&<div className="mt-3 rounded-xl bg-rose-50 border border-rose-200 px-3 py-2 text-sm text-rose-700">{msg}</div>}
+          <div className="grid grid-cols-2 gap-2 mt-4">
+            <button disabled={busy} onClick={()=>setEditing(null)} className="px-4 py-2.5 rounded-xl border border-slate-200 font-semibold text-sm">Cancel</button>
+            <button disabled={busy} onClick={saveEdit} className="px-4 py-2.5 rounded-xl bg-slate-900 text-white font-semibold text-sm disabled:opacity-50 flex items-center justify-center gap-2">{busy&&<Loader2 className="w-4 h-4 animate-spin"/>}Save</button>
+          </div>
+        </div>
+      </Modal>
+    </section>
   );
 }
 
